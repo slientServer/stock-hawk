@@ -1,0 +1,25 @@
+sources:
+  market_realtime:
+    enabled: true
+    primary: sina
+    fallback: tencent
+    interval_seconds: 3
+  market_kline:
+    enabled: true
+    provider: akshare
+    fallback: "tushare -> eastmoney_direct -> sina_direct -> tencent_direct"
+    schedule: "15:30"
+  financial_report:
+    enabled: true
+    provider: tushare
+    requires: TUSHARE_TOKEN
+    schedule: "18:30"
+  fund_flow:
+    enabled: true
+    schedule: "16:00"
+  news:
+    enabled: false  # 需要确认RSS源
+  research_report:
+    enabled: false  # 需要确认API权限
+  overseas:
+    enabled: false  # 需要SEC EDGAR API Key

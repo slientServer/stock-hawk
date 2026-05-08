@@ -1,0 +1,28 @@
+# Environment
+.env
+
+# Data directories (volumes)
+data/postgres/
+data/neo4j/
+data/redis/
+data/chroma/
+data/files/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+.venv/
+
+# Runtime
+.pids/
+logs/
+
+# IDE
+.idea/
+.vscode/
+.trae/
+*.swp
+*.swo

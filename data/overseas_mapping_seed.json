@@ -1,0 +1,19 @@
+{
+  "mappings": [
+    {"a_code": "002415", "a_name": "海康威视", "overseas_symbol": "AXON", "overseas_name": "Axon Enterprise", "relation_type": "competitor", "chain_id": "安防产业链"},
+    {"a_code": "300474", "a_name": "景嘉微", "overseas_symbol": "NVDA", "overseas_name": "NVIDIA", "relation_type": "benchmark", "chain_id": "AI算力产业链"},
+    {"a_code": "688256", "a_name": "寒武纪", "overseas_symbol": "NVDA", "overseas_name": "NVIDIA", "relation_type": "benchmark", "chain_id": "AI算力产业链"},
+    {"a_code": "688041", "a_name": "海光信息", "overseas_symbol": "AMD", "overseas_name": "AMD", "relation_type": "benchmark", "chain_id": "AI算力产业链"},
+    {"a_code": "300308", "a_name": "中际旭创", "overseas_symbol": "COHR", "overseas_name": "Coherent", "relation_type": "competitor", "chain_id": "光通信产业链"},
+    {"a_code": "688498", "a_name": "源杰科技", "overseas_symbol": "LITE", "overseas_name": "Lumentum", "relation_type": "benchmark", "chain_id": "光通信产业链"},
+    {"a_code": "300502", "a_name": "新易盛", "overseas_symbol": "COHR", "overseas_name": "Coherent", "relation_type": "competitor", "chain_id": "光通信产业链"},
+    {"a_code": "002049", "a_name": "紫光国微", "overseas_symbol": "AVGO", "overseas_name": "Broadcom", "relation_type": "benchmark", "chain_id": "半导体产业链"},
+    {"a_code": "688012", "a_name": "中微公司", "overseas_symbol": "LRCX", "overseas_name": "Lam Research", "relation_type": "benchmark", "chain_id": "半导体设备产业链"},
+    {"a_code": "002371", "a_name": "北方华创", "overseas_symbol": "AMAT", "overseas_name": "Applied Materials", "relation_type": "benchmark", "chain_id": "半导体设备产业链"},
+    {"a_code": "300750", "a_name": "宁德时代", "overseas_symbol": "TSLA", "overseas_name": "Tesla", "relation_type": "upstream", "chain_id": "新能源产业链"},
+    {"a_code": "002594", "a_name": "比亚迪", "overseas_symbol": "TSLA", "overseas_name": "Tesla", "relation_type": "competitor", "chain_id": "新能源产业链"},
+    {"a_code": "601012", "a_name": "隆基绿能", "overseas_symbol": "ENPH", "overseas_name": "Enphase Energy", "relation_type": "benchmark", "chain_id": "光伏产业链"},
+    {"a_code": "688599", "a_name": "天合光能", "overseas_symbol": "FSLR", "overseas_name": "First Solar", "relation_type": "competitor", "chain_id": "光伏产业链"},
+    {"a_code": "300124", "a_name": "汇川技术", "overseas_symbol": "ROK", "overseas_name": "Rockwell Automation", "relation_type": "benchmark", "chain_id": "工业自动化产业链"}
+  ]
+}

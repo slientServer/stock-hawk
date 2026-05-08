@@ -1,0 +1,21 @@
+{
+  "products": [
+    {"name": "沪铜", "symbol": "CU0", "chain_ids": ["半导体产业链", "新能源产业链"], "source_type": "futures"},
+    {"name": "沪铝", "symbol": "AL0", "chain_ids": ["新能源产业链"], "source_type": "futures"},
+    {"name": "沪锌", "symbol": "ZN0", "chain_ids": [], "source_type": "futures"},
+    {"name": "沪镍", "symbol": "NI0", "chain_ids": ["新能源产业链"], "source_type": "futures"},
+    {"name": "硅铁", "symbol": "SF0", "chain_ids": ["光伏产业链"], "source_type": "futures"},
+    {"name": "工业硅", "symbol": "SI0", "chain_ids": ["光伏产业链", "半导体产业链"], "source_type": "futures"},
+    {"name": "纯碱", "symbol": "SA0", "chain_ids": ["光伏产业链"], "source_type": "futures"},
+    {"name": "碳酸锂", "symbol": "LC0", "chain_ids": ["新能源产业链"], "source_type": "futures"},
+    {"name": "聚乙烯", "symbol": "L0", "chain_ids": [], "source_type": "futures"},
+    {"name": "聚丙烯", "symbol": "PP0", "chain_ids": [], "source_type": "futures"},
+    {"name": "PTA", "symbol": "TA0", "chain_ids": [], "source_type": "futures"},
+    {"name": "光模块(800G)", "symbol": null, "chain_ids": ["光通信产业链"], "source_type": "manual"},
+    {"name": "光芯片(CW)", "symbol": null, "chain_ids": ["光通信产业链"], "source_type": "manual"},
+    {"name": "HBM颗粒", "symbol": null, "chain_ids": ["AI算力产业链", "半导体产业链"], "source_type": "manual"},
+    {"name": "CoWoS产能", "symbol": null, "chain_ids": ["AI算力产业链", "半导体产业链"], "source_type": "manual"},
+    {"name": "GPU(H100)", "symbol": null, "chain_ids": ["AI算力产业链"], "source_type": "manual"},
+    {"name": "MLCC", "symbol": null, "chain_ids": ["消费电子产业链"], "source_type": "manual"}
+  ]
+}
