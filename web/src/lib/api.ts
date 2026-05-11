@@ -256,6 +256,64 @@ export async function streamAdvisorStockAnalysis(
   }
 }
 
+// ─── 尾盘选股 ─────────────────────────
+export async function runEodScreener(tradeDate?: string, includeBacktest = true, mode: "intraday" | "stored" | "daily" = "intraday") {
+  return fetchAPI<any>("/eod-screener/run", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ trade_date: tradeDate || null, include_backtest: includeBacktest, mode, lookback_days: 30 }),
+  });
+}
+export async function getEodMarketCoverage(tradeDate?: string) {
+  const q = new URLSearchParams();
+  if (tradeDate) q.set("trade_date", tradeDate);
+  return fetchAPI<any>(`/eod-screener/coverage?${q}`);
+}
+export async function collectEodFullMarket(data: { trade_date?: string; lookback_days?: number; run_after?: boolean; mode?: "intraday" | "daily" | "auto" } = {}) {
+  return fetchAPI<any>("/eod-screener/collect-full-market", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      trade_date: data.trade_date || null,
+      lookback_days: data.lookback_days ?? 30,
+      mode: data.mode ?? "intraday",
+      run_after: data.run_after ?? false,
+    }),
+  });
+}
+export async function getEodScreenerResults(params?: { trade_date?: string; limit?: number }) {
+  const q = new URLSearchParams();
+  if (params?.trade_date) q.set("trade_date", params.trade_date);
+  if (params?.limit) q.set("limit", String(params.limit));
+  return fetchAPI<any[]>(`/eod-screener/results?${q}`);
+}
+export async function getEodScreenerStockHistory(code: string, limit = 30) {
+  return fetchAPI<any[]>(`/eod-screener/results/${code}/history?limit=${limit}`);
+}
+export async function getEodScreenerConfig() {
+  return fetchAPI<any>("/eod-screener/config");
+}
+export async function updateEodScreenerConfig(data: Record<string, any>) {
+  return fetchAPI<any>("/eod-screener/config", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+export async function runEodBacktest(body: { start_date: string; end_date: string; code?: string }) {
+  return fetchAPI<any>("/eod-screener/backtest", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+export async function getEodBacktestResults(params?: { task_id?: string; limit?: number }) {
+  const q = new URLSearchParams();
+  if (params?.task_id) q.set("task_id", params.task_id);
+  if (params?.limit) q.set("limit", String(params.limit));
+  return fetchAPI<any[]>(`/eod-screener/backtest/results?${q}`);
+}
+
 // ─── 设置 ───────────────────────────
 export async function getSettings() {
   return fetchAPI<any>("/settings");

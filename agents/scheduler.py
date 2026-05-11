@@ -1,6 +1,7 @@
 """Agent 调度器：APScheduler 定时任务管理"""
 
 import asyncio
+from datetime import date
 from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -17,6 +18,7 @@ class AgentScheduler:
     """定时任务管理：每日扫描、每周分析、手动触发"""
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession], automation_runner: AutomationRunner | None = None):
+        self._session_factory = session_factory
         self._orchestrator = Orchestrator(session_factory)
         self._automation = automation_runner or AutomationRunner(session_factory)
         self._scheduler = AsyncIOScheduler()
@@ -32,6 +34,16 @@ class AgentScheduler:
             minute=0,
             id="daily_scan",
             name="交易日收盘自动流程",
+        )
+        # 尾盘选股：周一至周五 14:50（盘中实时快照）
+        self._scheduler.add_job(
+            self._run_eod_screener,
+            "cron",
+            day_of_week="mon-fri",
+            hour=14,
+            minute=50,
+            id="eod_screener",
+            name="尾盘盘中自动选股",
         )
         # 每周分析：周六 10:00
         self._scheduler.add_job(
@@ -93,6 +105,8 @@ class AgentScheduler:
             return await self._automation.run("chain_discovery", trigger="manual", params=kwargs)
         elif workflow_type in {"daily_scan", "weekly_analysis", "weekly_discovery"}:
             return await self._automation.run(workflow_type, trigger="manual", params=kwargs)
+        elif workflow_type == "eod_screener":
+            return await self._run_eod_screener_manual(**kwargs)
         else:
             return {"error": f"Unknown workflow_type: {workflow_type}"}
 
@@ -116,3 +130,67 @@ class AgentScheduler:
             await self._automation.run("weekly_discovery", trigger="cron")
         except Exception as e:
             logger.error(f"Chain discovery cron failed: {e}")
+
+    async def _run_eod_screener(self):
+        logger.info("Cron trigger: eod_screener")
+        try:
+            result = await self._collect_and_run_eod_screener(date.today())
+            logger.info(
+                "尾盘选股完成: status=%s, trade_date=%s, count=%s",
+                result.get("status"),
+                result.get("trade_date"),
+                result.get("count"),
+            )
+        except Exception as e:
+            logger.error(f"EOD screener cron failed: {e}")
+
+    async def _run_eod_screener_manual(self, **kwargs) -> dict[str, Any]:
+        try:
+            trade_date = self._parse_trade_date(kwargs.get("trade_date"))
+            return await self._collect_and_run_eod_screener(trade_date)
+        except Exception as e:
+            logger.error(f"EOD screener manual failed: {e}")
+            return {"status": "failed", "error": str(e)}
+
+    async def _collect_and_run_eod_screener(self, trade_date: date | None = None) -> dict[str, Any]:
+        from data_collector.cache.redis_cache import RedisCache
+        from data_collector.sources.market_kline import KlineCollector
+        from data_collector.storage import DataStorage
+        from eod_screener.screener import EODScreener
+
+        storage = DataStorage(self._session_factory)
+        collector = KlineCollector(storage, RedisCache())
+        collect_result = await collector.collect_full_market_daily(trade_date, lookback_days=30, mode="intraday")
+        if collect_result.get("status") == "failed":
+            return {
+                "status": "blocked",
+                "trade_date": collect_result.get("trade_date") or (str(trade_date) if trade_date else None),
+                "count": 0,
+                "collect_result": collect_result,
+                "screen_result": None,
+            }
+
+        screener = EODScreener(self._session_factory)
+        run_trade_date = self._parse_trade_date(collect_result.get("trade_date")) or trade_date
+        screen_result = await screener.run_with_diagnostics(
+            run_trade_date,
+            data_mode=str(collect_result.get("data_mode") or "intraday"),
+            quote_source=collect_result.get("source"),
+            quote_time=collect_result.get("quote_time"),
+        )
+        return {
+            "status": screen_result.get("status"),
+            "trade_date": screen_result.get("trade_date"),
+            "count": screen_result.get("count", 0),
+            "collect_result": collect_result,
+            "screen_result": screen_result,
+        }
+
+    @staticmethod
+    def _parse_trade_date(value: Any) -> date | None:
+        if value is None or isinstance(value, date):
+            return value
+        try:
+            return date.fromisoformat(str(value))
+        except ValueError:
+            return None

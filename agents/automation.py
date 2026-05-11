@@ -242,11 +242,16 @@ class AutomationRunner:
         )
         return result
 
-    async def _collect(self, task: str, *, days: int, years: int) -> dict[str, Any]:
+    async def _collect(self, task: str, *, days: int | None = None, years: int | None = None) -> dict[str, Any]:
         # Reuse the same collection implementation as the manual data page.
         from api.routes.stocks import DataCollectRequest, _run_collect_task
 
-        return await _run_collect_task(DataCollectRequest(task=task, days=days, years=years))
+        payload: dict[str, Any] = {"task": task}
+        if days is not None:
+            payload["days"] = days
+        if years is not None:
+            payload["years"] = years
+        return await _run_collect_task(DataCollectRequest(**payload))
 
     async def _step(self, ctx: dict[str, Any], name: str, fn: Callable[[], Awaitable[Any]]) -> Any:
         started = datetime.now()

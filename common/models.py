@@ -360,3 +360,59 @@ class InstitutionalHolding(Base):
         UniqueConstraint("code", "report_date", "institution_name", name="uq_institutional_holdings_code_date_inst"),
         Index("ix_institutional_holdings_code_date", "code", "report_date"),
     )
+
+
+class EodScreenResult(Base):
+    __tablename__ = "eod_screen_results"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(10), index=True)
+    trade_date: Mapped[date] = mapped_column(Date, index=True)
+    name: Mapped[str | None] = mapped_column(String(50))
+    close_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    change_pct: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    volume_ratio: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    turnover_rate: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    late_strength: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    score: Mapped[Decimal | None] = mapped_column(Numeric(6, 2))
+    rank: Mapped[int | None] = mapped_column(Integer)
+    signal_strength: Mapped[str | None] = mapped_column(String(10))
+    target_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    stop_loss_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    suggestion: Mapped[str | None] = mapped_column(Text)
+    data_mode: Mapped[str | None] = mapped_column(String(20))
+    quote_source: Mapped[str | None] = mapped_column(String(50))
+    quote_time: Mapped[datetime | None] = mapped_column(DateTime)
+    backtest_start_date: Mapped[date | None] = mapped_column(Date)
+    backtest_end_date: Mapped[date | None] = mapped_column(Date)
+    backtest_total_trades: Mapped[int | None] = mapped_column(Integer)
+    backtest_win_rate: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    backtest_avg_return: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    backtest_max_drawdown: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    backtest_profit_loss_ratio: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    backtest_score: Mapped[Decimal | None] = mapped_column(Numeric(6, 2))
+    config_snapshot: Mapped[dict | None] = mapped_column(JSON)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("code", "trade_date", name="uq_eod_screen_results_code_date"),
+        Index("ix_eod_screen_results_date_score", "trade_date", "score"),
+        Index("ix_eod_screen_results_date_backtest", "trade_date", "backtest_score"),
+    )
+
+
+class EodBacktestResult(Base):
+    __tablename__ = "eod_backtest_results"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    task_id: Mapped[str | None] = mapped_column(String(50), index=True)
+    start_date: Mapped[date | None] = mapped_column(Date)
+    end_date: Mapped[date | None] = mapped_column(Date)
+    total_trades: Mapped[int | None] = mapped_column(Integer)
+    win_rate: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    avg_return: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    max_drawdown: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    profit_loss_ratio: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    config_snapshot: Mapped[dict | None] = mapped_column(JSON)
+    result_detail: Mapped[dict | None] = mapped_column(JSON)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, server_default=func.now())

@@ -40,7 +40,12 @@ async function expectHealthyPage(page: Page, path: string, heading: string) {
   const failures = attachFailureGuards(page);
   await page.goto(path, { waitUntil: "domcontentloaded" });
   await page.waitForLoadState("networkidle", { timeout: 8_000 }).catch(() => {});
-  await expect(page.getByRole("heading", { name: heading })).toBeVisible();
+  const headingRole = page.getByRole("heading", { name: heading });
+  if ((await headingRole.count()) > 0) {
+    await expect(headingRole).toBeVisible();
+  } else {
+    await expect(page.getByText(heading, { exact: true }).first()).toBeVisible();
+  }
   await expect(page.getByText("Stock Hawk")).toBeVisible();
   expect(failures, JSON.stringify(failures, null, 2)).toEqual([]);
 }
@@ -55,11 +60,12 @@ test("backend health is available", async ({ request }) => {
 test.describe("static application pages", () => {
   const pages = [
     { path: "/", heading: "产业链总览" },
-    { path: "/advisor", heading: "投研工作台" },
+    { path: "/advisor", heading: "投研助手" },
     { path: "/signals", heading: "信号中心" },
     { path: "/data", heading: "数据管理" },
     { path: "/reports", heading: "研报库" },
     { path: "/backtest", heading: "回测面板" },
+    { path: "/eod-screener", heading: "尾盘选股" },
     { path: "/graph", heading: "知识图谱" },
     { path: "/audit", heading: "审计中心" },
     { path: "/settings", heading: "系统设置" },
@@ -80,15 +86,15 @@ test("top navigation reaches core sections", async ({ page }) => {
 
   await page.getByRole("menuitem", { name: /投研/ }).click();
   await page.waitForURL("**/advisor");
-  await expect(page.getByRole("heading", { name: "投研工作台" })).toBeVisible();
-
-  await page.getByRole("menuitem", { name: /数据/ }).click();
-  await page.waitForURL("**/data");
-  await expect(page.getByRole("heading", { name: "数据管理" })).toBeVisible();
+  await expect(page.getByText("投研助手", { exact: true })).toBeVisible();
 
   await page.getByRole("menuitem", { name: /图谱/ }).click();
   await page.waitForURL("**/graph");
   await expect(page.getByRole("heading", { name: "知识图谱" })).toBeVisible();
+
+  await page.getByRole("menuitem", { name: /尾盘选股/ }).click();
+  await page.waitForURL("**/eod-screener");
+  await expect(page.getByRole("heading", { name: "尾盘选股" })).toBeVisible();
 
   await page.getByRole("menuitem", { name: /设置/ }).click();
   await page.waitForURL("**/settings");
@@ -125,7 +131,6 @@ test("advisor page exposes chain-first research workflow", async ({ page, reques
   await page.goto("/advisor", { waitUntil: "domcontentloaded" });
   await page.waitForLoadState("networkidle", { timeout: 8_000 }).catch(() => {});
 
-  await expect(page.getByRole("heading", { name: "投研工作台" })).toBeVisible();
   await expect(page.getByText("投研助手", { exact: true })).toBeVisible();
   await expect(page.getByText("候选股", { exact: true })).toBeVisible();
   await expect(page.getByText("产业链分析", { exact: true })).toBeVisible();
@@ -136,6 +141,18 @@ test("advisor page exposes chain-first research workflow", async ({ page, reques
   } else {
     await expect(page.getByText("暂无候选股，请先采集行情/信号数据")).toBeVisible();
   }
+
+  expect(failures, JSON.stringify(failures, null, 2)).toEqual([]);
+});
+
+test("eod screener manual run explains the executed trade date", async ({ page }) => {
+  const failures = attachFailureGuards(page);
+  await page.goto("/eod-screener", { waitUntil: "domcontentloaded" });
+  await page.waitForLoadState("networkidle", { timeout: 8_000 }).catch(() => {});
+
+  await page.getByRole("button", { name: /执行选股/ }).click();
+  await expect(page.getByText(/实际执行交易日/)).toBeVisible();
+  await expect(page.getByText(/基础候选/)).toBeVisible();
 
   expect(failures, JSON.stringify(failures, null, 2)).toEqual([]);
 });

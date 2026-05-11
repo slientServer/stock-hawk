@@ -32,9 +32,9 @@ class DataStorage:
                     close = EXCLUDED.close,
                     high = EXCLUDED.high,
                     low = EXCLUDED.low,
-                    volume = EXCLUDED.volume,
-                    amount = EXCLUDED.amount,
-                    turnover_rate = EXCLUDED.turnover_rate,
+                    volume = COALESCE(EXCLUDED.volume, daily_klines.volume),
+                    amount = COALESCE(EXCLUDED.amount, daily_klines.amount),
+                    turnover_rate = COALESCE(EXCLUDED.turnover_rate, daily_klines.turnover_rate),
                     source = EXCLUDED.source,
                     updated_at = EXCLUDED.updated_at
             """)
@@ -97,6 +97,32 @@ class DataStorage:
             now = datetime.now()
             for record in records:
                 record.setdefault("listed_date", None)
+                record.setdefault("updated_at", now)
+            await session.execute(stmt, records)
+            await session.commit()
+
+    async def update_stock_market_fields(self, records: list[dict]):
+        """批量更新股票行情派生字段，避免覆盖基础库中已有行业/上市日期。"""
+        if not records:
+            return
+        async with self.session_factory() as session:
+            stmt = text("""
+                UPDATE stocks SET
+                    name = COALESCE(:name, name),
+                    market = COALESCE(:market, market),
+                    market_cap = COALESCE(:market_cap, market_cap),
+                    listed_date = COALESCE(:listed_date, listed_date),
+                    is_st = COALESCE(:is_st, is_st),
+                    updated_at = :updated_at
+                WHERE code = :code
+            """)
+            now = datetime.now()
+            for record in records:
+                record.setdefault("name", None)
+                record.setdefault("market", None)
+                record.setdefault("market_cap", None)
+                record.setdefault("listed_date", None)
+                record.setdefault("is_st", None)
                 record.setdefault("updated_at", now)
             await session.execute(stmt, records)
             await session.commit()

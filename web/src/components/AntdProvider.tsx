@@ -11,6 +11,7 @@ import {
   SettingOutlined,
   DatabaseOutlined,
   RadarChartOutlined,
+  StockOutlined,
 } from "@ant-design/icons";
 import { usePathname, useRouter } from "next/navigation";
 import zhCN from "antd/locale/zh_CN";
@@ -22,6 +23,7 @@ const NAV_ITEMS = [
   { key: "/advisor", label: "投研", icon: <RadarChartOutlined /> },
   { key: "/graph", label: "图谱", icon: <ApartmentOutlined /> },
   { key: "/signals", label: "信号中心", icon: <ThunderboltOutlined /> },
+  { key: "/eod-screener", label: "尾盘选股", icon: <StockOutlined /> },
   { key: "/reports", label: "研报库", icon: <FileTextOutlined /> },
   { key: "/backtest", label: "回测", icon: <LineChartOutlined /> },
   { key: "/settings", label: "设置", icon: <SettingOutlined /> },
