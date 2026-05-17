@@ -11,6 +11,7 @@ import {
 } from "@ant-design/icons";
 import { useRouter } from "next/navigation";
 import { getDataCollectStatus, getDataCompleteness, getDataPreview, getDataStatsDetail, getStocks, triggerDataCollect } from "@/lib/api";
+import AddHoldingButton from "@/components/AddHoldingButton";
 
 const { Title, Text } = Typography;
 const { Search } = Input;
@@ -163,6 +164,14 @@ export default function DataPage() {
       key: "is_st",
       width: 60,
       render: (v: boolean) => v ? <Tag color="red">ST</Tag> : null,
+    },
+    {
+      title: "持仓",
+      key: "portfolio",
+      width: 90,
+      render: (_: any, row: any) => (
+        <AddHoldingButton code={row.code} name={row.name} source="data_stock_list" compact />
+      ),
     },
   ];
 

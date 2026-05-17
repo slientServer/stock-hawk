@@ -7,23 +7,29 @@ from api.routes.backtest import router as backtest_router
 from api.routes.chains import router as chains_router
 from api.routes.discovery import router as discovery_router
 from api.routes.eod_screener import router as eod_screener_router
+from api.routes.etf_analysis import router as etf_analysis_router
 from api.routes.graph import router as graph_router
+from api.routes.portfolio import router as portfolio_router
 from api.routes.reports import router as reports_router
 from api.routes.settings import router as settings_router
 from api.routes.signals import router as signals_router
+from api.routes.stock_analysis import router as stock_analysis_router
 from api.routes.stocks import router as stocks_router
 
 all_routers = [
     advisor_router,
+    stock_analysis_router,
     automation_router,
     chains_router,
     signals_router,
     stocks_router,
     backtest_router,
+    portfolio_router,
     reports_router,
     graph_router,
     audit_router,
     settings_router,
     discovery_router,
     eod_screener_router,
+    etf_analysis_router,
 ]

@@ -66,6 +66,7 @@ test.describe("static application pages", () => {
     { path: "/reports", heading: "研报库" },
     { path: "/backtest", heading: "回测面板" },
     { path: "/eod-screener", heading: "尾盘选股" },
+    { path: "/etf-analysis", heading: "ETF 板块轮动分析" },
     { path: "/graph", heading: "知识图谱" },
     { path: "/audit", heading: "审计中心" },
     { path: "/settings", heading: "系统设置" },

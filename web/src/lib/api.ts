@@ -88,6 +88,177 @@ export async function getDataPreview(source: string, limit = 20) {
   return fetchAPI<any>(`/stocks/data-preview?source=${encodeURIComponent(source)}&limit=${limit}`);
 }
 
+// ─── 持仓管理 ───────────────────────
+export async function getPortfolioQuote(code: string) {
+  return fetchAPI<any>(`/portfolio/quote/${encodeURIComponent(code)}`);
+}
+export async function getPortfolioPositions(params?: { include_closed?: boolean }) {
+  const q = new URLSearchParams();
+  if (params?.include_closed) q.set("include_closed", "true");
+  return fetchAPI<any>(`/portfolio/positions?${q}`);
+}
+export async function createPortfolioPosition(data: {
+  code: string;
+  name?: string;
+  quantity?: number;
+  buy_price?: number;
+  target_price?: number;
+  stop_loss_price?: number;
+  note?: string;
+  source?: string;
+}) {
+  return fetchAPI<any>("/portfolio/positions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+export async function updatePortfolioPosition(id: number, data: {
+  quantity?: number;
+  avg_cost?: number;
+  target_price?: number;
+  stop_loss_price?: number;
+  note?: string;
+}) {
+  return fetchAPI<any>(`/portfolio/positions/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+export async function closePortfolioPosition(id: number, data: { quantity?: number; close_price?: number; note?: string }) {
+  return fetchAPI<any>(`/portfolio/positions/${id}/close`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+export async function getPortfolioTransactions(params?: { code?: string; limit?: number }) {
+  const q = new URLSearchParams();
+  if (params?.code) q.set("code", params.code);
+  if (params?.limit) q.set("limit", String(params.limit));
+  return fetchAPI<any[]>(`/portfolio/transactions?${q}`);
+}
+
+// ─── 个股分析 ───────────────────────
+export async function runStockAnalysis(data: { code: string; lookback_days?: number; use_llm?: boolean; save?: boolean }) {
+  return fetchAPI<any>("/stock-analysis/run", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+export async function createStockAnalysisTask(data: { code: string; lookback_days?: number; use_llm?: boolean; save?: boolean }) {
+  return fetchAPI<any>("/stock-analysis/tasks", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+export async function getStockAnalysisTasks(limit = 30) {
+  return fetchAPI<any[]>(`/stock-analysis/tasks?limit=${limit}`);
+}
+export async function getStockAnalysisTask(taskId: string) {
+  return fetchAPI<any>(`/stock-analysis/tasks/${encodeURIComponent(taskId)}`);
+}
+export async function getStockAnalysisHistory(params?: { code?: string; limit?: number }) {
+  const q = new URLSearchParams();
+  if (params?.code) q.set("code", params.code);
+  if (params?.limit) q.set("limit", String(params.limit));
+  return fetchAPI<any[]>(`/stock-analysis/history?${q}`);
+}
+export async function getLatestStockAnalysis(code: string) {
+  return fetchAPI<any>(`/stock-analysis/latest/${encodeURIComponent(code)}`);
+}
+export async function getStockAnalysisReport(id: number | string) {
+  return fetchAPI<any>(`/stock-analysis/reports/${encodeURIComponent(String(id))}`);
+}
+
+// ─── ETF 分析 ───────────────────────
+export async function getEtfWatchlist() {
+  return fetchAPI<{ items: any[]; summary: any }>("/etf/watchlist");
+}
+export async function addEtfWatch(data: {
+  code: string;
+  name?: string;
+  sector?: string;
+  is_holding?: boolean;
+  cost_price?: number;
+  quantity?: number;
+  target_price?: number;
+  stop_loss_price?: number;
+  note?: string;
+}) {
+  return fetchAPI<any>("/etf/watchlist", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+export async function updateEtfWatch(id: number, data: {
+  name?: string;
+  sector?: string;
+  is_holding?: boolean;
+  cost_price?: number;
+  quantity?: number;
+  target_price?: number;
+  stop_loss_price?: number;
+  note?: string;
+}) {
+  return fetchAPI<any>(`/etf/watchlist/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+export async function removeEtfWatch(id: number) {
+  return fetchAPI<any>(`/etf/watchlist/${id}`, { method: "DELETE" });
+}
+export async function runEtfAnalysis(data: { use_llm?: boolean; lookback_days?: number; trigger_type?: string } = {}) {
+  return fetchAPI<any>("/etf/analysis/run", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      use_llm: data.use_llm ?? true,
+      lookback_days: data.lookback_days ?? 120,
+      trigger_type: data.trigger_type ?? "manual",
+    }),
+  });
+}
+export async function getEtfAnalysisTask(taskId: string) {
+  return fetchAPI<any>(`/etf/analysis/tasks/${encodeURIComponent(taskId)}`);
+}
+export async function getEtfAnalysisHistory(limit = 30) {
+  return fetchAPI<any[]>(`/etf/analysis/history?limit=${limit}`);
+}
+export async function getEtfAnalysisLatest() {
+  return fetchAPI<any>("/etf/analysis/latest");
+}
+export async function getEtfAnalysisRecord(id: number | string) {
+  return fetchAPI<any>(`/etf/analysis/records/${encodeURIComponent(String(id))}`);
+}
+export async function backfillEtfKline(code: string, lookbackDays = 120) {
+  return fetchAPI<any>("/etf/kline/backfill", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code, lookback_days: lookbackDays }),
+  });
+}
+export async function backfillMissingEtfKlines(recordId?: number, lookbackDays = 120) {
+  return fetchAPI<any>("/etf/analysis/backfill_missing", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ record_id: recordId, lookback_days: lookbackDays }),
+  });
+}
+export async function refreshEtfQuotes(codes?: string[]) {
+  return fetchAPI<any>("/etf/quote/refresh", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ codes: codes && codes.length ? codes : null }),
+  });
+}
+
 // ─── 回测 ───────────────────────────
 export async function runBacktest(body: { start_date: string; end_date: string; signal_type?: string; chain_id?: string }) {
   return fetchAPI<any>("/backtest/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });

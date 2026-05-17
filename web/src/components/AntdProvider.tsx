@@ -12,6 +12,9 @@ import {
   DatabaseOutlined,
   RadarChartOutlined,
   StockOutlined,
+  WalletOutlined,
+  BarChartOutlined,
+  FundOutlined,
 } from "@ant-design/icons";
 import { usePathname, useRouter } from "next/navigation";
 import zhCN from "antd/locale/zh_CN";
@@ -21,6 +24,9 @@ const { Header, Content } = Layout;
 
 const NAV_ITEMS = [
   { key: "/advisor", label: "投研", icon: <RadarChartOutlined /> },
+  { key: "/stock-analysis", label: "个股分析", icon: <BarChartOutlined /> },
+  { key: "/etf-analysis", label: "ETF分析", icon: <FundOutlined /> },
+  { key: "/portfolio", label: "持仓", icon: <WalletOutlined /> },
   { key: "/graph", label: "图谱", icon: <ApartmentOutlined /> },
   { key: "/signals", label: "信号中心", icon: <ThunderboltOutlined /> },
   { key: "/eod-screener", label: "尾盘选股", icon: <StockOutlined /> },
@@ -50,6 +56,7 @@ export default function AntdProvider({ children }: { children: ReactNode }) {
       : pathname === "/"
         ? "/"
         : NAV_ITEMS.flatMap((n) => n.children ? n.children : [n]).find((n) => n.key !== "/" && pathname.startsWith(n.key))?.key ?? "/";
+  const wideContent = pathname.startsWith("/advisor") || pathname.startsWith("/stock-analysis") || pathname.startsWith("/etf-analysis");
 
   return (
     <ConfigProvider
@@ -88,8 +95,8 @@ export default function AntdProvider({ children }: { children: ReactNode }) {
           </Header>
           <Content
             style={{
-              padding: pathname.startsWith("/advisor") ? "12px 16px" : 24,
-              maxWidth: pathname.startsWith("/advisor") ? 1760 : 1200,
+              padding: wideContent ? "12px 16px" : 24,
+              maxWidth: wideContent ? 1760 : 1200,
               margin: "0 auto",
               width: "100%",
             }}

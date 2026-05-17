@@ -13,7 +13,6 @@ import {
   Descriptions,
   Table,
   Timeline,
-  Divider,
   Statistic,
 } from "antd";
 import { useParams, useRouter } from "next/navigation";
@@ -21,8 +20,9 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { getReportDetail } from "@/lib/api";
 import { formatSignalType, formatTrendType, formatStage, formatConfidence } from "@/lib/labels";
+import AddHoldingButton from "@/components/AddHoldingButton";
 
-const { Title, Text, Paragraph } = Typography;
+const { Title, Text } = Typography;
 
 const STAGE_COLORS: Record<string, string> = {
   seed: "default",
@@ -368,6 +368,14 @@ function StockScreeningSection({ data }: { data: any }) {
   const columns = [
     { title: "代码", dataIndex: "code", width: 80 },
     { title: "名称", dataIndex: "name", width: 100 },
+    {
+      title: "持仓",
+      key: "portfolio",
+      width: 90,
+      render: (_: any, row: any) => (
+        <AddHoldingButton code={row.code} name={row.name} source="report_screening" compact />
+      ),
+    },
     {
       title: "评分",
       dataIndex: "score",

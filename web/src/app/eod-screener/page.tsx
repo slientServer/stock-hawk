@@ -41,6 +41,7 @@ import {
   getEodBacktestResults,
   collectEodFullMarket,
 } from "@/lib/api";
+import AddHoldingButton from "@/components/AddHoldingButton";
 
 const { Title, Text } = Typography;
 const { RangePicker } = DatePicker;
@@ -221,6 +222,14 @@ export default function EodScreenerPage() {
     },
     { title: "代码", dataIndex: "code", key: "code", width: 80 },
     { title: "名称", dataIndex: "name", key: "name", width: 90 },
+    {
+      title: "持仓",
+      key: "portfolio",
+      width: 90,
+      render: (_: any, r: any) => (
+        <AddHoldingButton code={r.code} name={r.name} source="eod_screener" compact />
+      ),
+    },
     {
       title: "行情",
       key: "quote",

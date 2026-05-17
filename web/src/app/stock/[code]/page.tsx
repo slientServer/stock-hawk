@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import {
   Alert,
   Breadcrumb,
+  Button,
   Card,
   Col,
   Descriptions,
@@ -16,11 +17,12 @@ import {
   Tag,
   Typography,
 } from "antd";
-import { ArrowDownOutlined, ArrowUpOutlined } from "@ant-design/icons";
+import { ArrowDownOutlined, ArrowUpOutlined, BarChartOutlined } from "@ant-design/icons";
 import { useParams, useRouter } from "next/navigation";
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { getFinancials, getKline, getStock, getStockSnapshot } from "@/lib/api";
 import { formatSignalType } from "@/lib/labels";
+import AddHoldingButton from "@/components/AddHoldingButton";
 
 const { Title, Text } = Typography;
 
@@ -137,6 +139,12 @@ export default function StockDetailPage() {
             <Tag color={snapshot?.confidence === "low" ? "orange" : "green"}>置信度 {snapshot?.confidence ?? "-"}</Tag>
           </Space>
         </div>
+        <Space wrap>
+          <Button icon={<BarChartOutlined />} onClick={() => router.push(`/stock-analysis?code=${encodeURIComponent(code)}`)}>
+            完整分析
+          </Button>
+          <AddHoldingButton code={code} name={stock.name} type="primary" size="middle" source="stock_detail" />
+        </Space>
       </div>
       {dataGaps.length > 0 && (
         <Alert

@@ -6,8 +6,23 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { getSignals, getSignalTypes, triggerSignalScan, getScanStatus } from "@/lib/api";
 import { formatScanProgress, formatSignalType } from "@/lib/labels";
 import { ThunderboltOutlined, ReloadOutlined } from "@ant-design/icons";
+import AddHoldingButton from "@/components/AddHoldingButton";
 
 const { Title, Text } = Typography;
+
+function signalStocks(row: any) {
+  const codes = row?.target_codes;
+  if (Array.isArray(codes)) return codes.map((code) => ({ code: String(code), name: "" })).filter((item) => item.code);
+  if (codes && typeof codes === "object") {
+    return Object.values(codes).flatMap((value: any) => Array.isArray(value) ? value : [value])
+      .map((code: any) => ({ code: String(code), name: "" }))
+      .filter((item: any) => item.code);
+  }
+  if (row?.source_entity && /^\d{6}$/.test(String(row.source_entity))) {
+    return [{ code: String(row.source_entity), name: "" }];
+  }
+  return [];
+}
 
 function SignalsContent() {
   const { message } = App.useApp();
@@ -132,7 +147,24 @@ function SignalsContent() {
       title: "描述",
       dataIndex: "detail",
       key: "detail",
-      render: (v: string) => <span style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{v || "-"}</span>,
+      render: (v: string, row: any) => {
+        const stocks = signalStocks(row);
+        return (
+          <Space direction="vertical" size={6} style={{ width: "100%" }}>
+            <span style={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}>{v || "-"}</span>
+            {stocks.length > 0 && (
+              <Space wrap size={[4, 4]}>
+                {stocks.map((stock: any) => (
+                  <Space key={`${row.id}-${stock.code}`} size={2}>
+                    <Tag color="geekblue" style={{ marginInlineEnd: 0 }}>{stock.code}</Tag>
+                    <AddHoldingButton code={stock.code} source="signal_center" compact type="text" />
+                  </Space>
+                ))}
+              </Space>
+            )}
+          </Space>
+        );
+      },
     },
     {
       title: "强度",

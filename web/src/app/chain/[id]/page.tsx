@@ -7,6 +7,7 @@ import { useParams, useRouter } from "next/navigation";
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { getChainDetail, getChainScores, getChainTopology, triggerSignalScan } from "@/lib/api";
 import { formatSignalType } from "@/lib/labels";
+import AddHoldingButton from "@/components/AddHoldingButton";
 
 const { Title, Text } = Typography;
 
@@ -99,13 +100,15 @@ export default function ChainDetailPage() {
         return (
           <div style={{ display: "flex", flexWrap: "wrap", gap: 6, maxHeight: 72, overflow: "auto" }}>
             {companies.map((comp: any) => (
-              <Tag
-                key={comp.code}
-                style={{ cursor: "pointer", marginInlineEnd: 0 }}
-                onClick={() => router.push(`/stock/${comp.code}`)}
-              >
-                {comp.name} ({comp.code})
-              </Tag>
+              <Space key={comp.code} size={2}>
+                <Tag
+                  style={{ cursor: "pointer", marginInlineEnd: 0 }}
+                  onClick={() => router.push(`/stock/${comp.code}`)}
+                >
+                  {comp.name} ({comp.code})
+                </Tag>
+                <AddHoldingButton code={comp.code} name={comp.name} source="chain_segment" compact type="text" />
+              </Space>
             ))}
           </div>
         );
@@ -119,14 +122,16 @@ export default function ChainDetailPage() {
       {(row.target_stocks ?? []).length > 0 && (
         <Space wrap size={[4, 4]}>
           {(row.target_stocks ?? []).map((stock: any) => (
-            <Tag
-              key={stock.code}
-              color={stock.name ? "geekblue" : "default"}
-              style={{ cursor: "pointer", marginInlineEnd: 0 }}
-              onClick={() => router.push(`/stock/${stock.code}`)}
-            >
-              {stock.name ? `${stock.name} (${stock.code})` : stock.code}
-            </Tag>
+            <Space key={stock.code} size={2}>
+              <Tag
+                color={stock.name ? "geekblue" : "default"}
+                style={{ cursor: "pointer", marginInlineEnd: 0 }}
+                onClick={() => router.push(`/stock/${stock.code}`)}
+              >
+                {stock.name ? `${stock.name} (${stock.code})` : stock.code}
+              </Tag>
+              <AddHoldingButton code={stock.code} name={stock.name} source="chain_signal" compact type="text" />
+            </Space>
           ))}
         </Space>
       )}

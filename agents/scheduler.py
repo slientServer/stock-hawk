@@ -65,6 +65,16 @@ class AgentScheduler:
             id="chain_discovery",
             name="周末产业链发现与周报",
         )
+        # ETF 板块轮动分析：周一至周五 18:30
+        self._scheduler.add_job(
+            self._run_etf_analysis,
+            "cron",
+            day_of_week="mon-fri",
+            hour=18,
+            minute=30,
+            id="etf_analysis",
+            name="ETF板块轮动定时分析",
+        )
 
     def start(self):
         self._scheduler.start()
@@ -107,6 +117,8 @@ class AgentScheduler:
             return await self._automation.run(workflow_type, trigger="manual", params=kwargs)
         elif workflow_type == "eod_screener":
             return await self._run_eod_screener_manual(**kwargs)
+        elif workflow_type == "etf_analysis":
+            return await self._run_etf_analysis_manual()
         else:
             return {"error": f"Unknown workflow_type: {workflow_type}"}
 
@@ -150,6 +162,29 @@ class AgentScheduler:
             return await self._collect_and_run_eod_screener(trade_date)
         except Exception as e:
             logger.error(f"EOD screener manual failed: {e}")
+            return {"status": "failed", "error": str(e)}
+
+    async def _run_etf_analysis(self):
+        logger.info("Cron trigger: etf_analysis")
+        try:
+            from api.routes.etf_analysis import run_scheduled_etf_analysis
+
+            result = await run_scheduled_etf_analysis(self._session_factory)
+            logger.info(
+                "ETF板块轮动分析完成: task=%s, etf_count=%s",
+                result.get("task_id"),
+                result.get("etf_count"),
+            )
+        except Exception as e:
+            logger.error(f"ETF analysis cron failed: {e}")
+
+    async def _run_etf_analysis_manual(self) -> dict[str, Any]:
+        try:
+            from api.routes.etf_analysis import run_scheduled_etf_analysis
+
+            return await run_scheduled_etf_analysis(self._session_factory)
+        except Exception as e:
+            logger.error(f"ETF analysis manual failed: {e}")
             return {"status": "failed", "error": str(e)}
 
     async def _collect_and_run_eod_screener(self, trade_date: date | None = None) -> dict[str, Any]:

@@ -25,6 +25,7 @@ import {
   streamAdvisorStockAnalysis,
 } from "@/lib/api";
 import { formatConfidence, formatSignalType, formatStage, formatTrendType } from "@/lib/labels";
+import AddHoldingButton from "@/components/AddHoldingButton";
 
 const { Text, Paragraph } = Typography;
 
@@ -247,6 +248,14 @@ function AdvisorContent({
       ),
     },
     {
+      title: "持仓",
+      key: "portfolio",
+      width: 96,
+      render: (_: any, row: any) => (
+        <AddHoldingButton code={row.code} name={row.name} source="advisor_pick" compact />
+      ),
+    },
+    {
       title: "评分",
       dataIndex: "score",
       key: "score",
@@ -289,6 +298,14 @@ function AdvisorContent({
             <Text type="secondary" style={{ fontSize: 11 }}>评分 {row.score ?? "-"}</Text>
           </Space>
         </Space>
+      ),
+    },
+    {
+      title: "持仓",
+      key: "portfolio",
+      width: 96,
+      render: (_: any, row: any) => (
+        <AddHoldingButton code={row.code} name={row.name} source="advisor_watch" compact />
       ),
     },
     {
@@ -615,6 +632,14 @@ function ChatBubble({ item, index }: { item: ChatMessage; index: number }) {
         <span>{row.name} <Text type="secondary">{row.code}</Text></span>
       ),
     },
+    {
+      title: "持仓",
+      key: "portfolio",
+      width: 80,
+      render: (_: any, row: any) => (
+        <AddHoldingButton code={row.code} name={row.name} source="advisor_chat" compact />
+      ),
+    },
     { title: "评分", dataIndex: "score", key: "score", width: 90 },
     { title: "层级", dataIndex: "tier", key: "tier", width: 100 },
     {
@@ -829,7 +854,7 @@ function FundFlowSection({ selectedChain }: { selectedChain: string }) {
       .finally(() => setLoading(false));
   }, [selectedChain, period]);
 
-  const items = data?.items ?? [];
+  const items = useMemo(() => data?.items ?? [], [data]);
   const north = data?.north_flow_summary;
   const dataGaps = data?.data_gaps;
 
@@ -1144,13 +1169,15 @@ function TransmissionPath({ analysis, segments, allCompanies, router }: { analys
               ) : (
                 <Space wrap size={[3, 4]}>
                   {companies.map((company) => (
-                    <Tag
-                      key={`${segment}-${company.code || company.name}`}
-                      style={{ cursor: company.code ? "pointer" : "default", marginInlineEnd: 0, fontSize: 11 }}
-                      onClick={() => company.code && router.push(`/stock/${company.code}`)}
-                    >
-                      {company.name || company.code}
-                    </Tag>
+                    <Space key={`${segment}-${company.code || company.name}`} size={2}>
+                      <Tag
+                        style={{ cursor: company.code ? "pointer" : "default", marginInlineEnd: 0, fontSize: 11 }}
+                        onClick={() => company.code && router.push(`/stock/${company.code}`)}
+                      >
+                        {company.name || company.code}
+                      </Tag>
+                      <AddHoldingButton code={company.code} name={company.name} source="advisor_transmission" compact type="text" />
+                    </Space>
                   ))}
                 </Space>
               )}
@@ -1163,13 +1190,15 @@ function TransmissionPath({ analysis, segments, allCompanies, router }: { analys
           <Text type="secondary" style={{ fontSize: 11 }}>图谱公司（未分配至环节）：</Text>
           <Space wrap size={[3, 4]} style={{ marginTop: 4 }}>
             {fallbackCompanies.slice(0, 20).map((company) => (
-              <Tag
-                key={company.code || company.name}
-                style={{ cursor: company.code ? "pointer" : "default", marginInlineEnd: 0, fontSize: 11 }}
-                onClick={() => company.code && router.push(`/stock/${company.code}`)}
-              >
-                {company.name || company.code}
-              </Tag>
+              <Space key={company.code || company.name} size={2}>
+                <Tag
+                  style={{ cursor: company.code ? "pointer" : "default", marginInlineEnd: 0, fontSize: 11 }}
+                  onClick={() => company.code && router.push(`/stock/${company.code}`)}
+                >
+                  {company.name || company.code}
+                </Tag>
+                <AddHoldingButton code={company.code} name={company.name} source="advisor_transmission" compact type="text" />
+              </Space>
             ))}
             {fallbackCompanies.length > 20 && <Text type="secondary" style={{ fontSize: 11 }}>等 {fallbackCompanies.length} 家</Text>}
           </Space>
@@ -1202,14 +1231,16 @@ function KeySignals({ signals, chainName, router }: { signals: any[]; chainName:
                   <Tag color="blue" style={{ fontSize: 11 }}>{formatSignalType(signal.signal_type)}</Tag>
                   {stocks.length > 0 ? (
                     stocks.map((stock) => (
-                      <Tag
-                        key={`${signal.id ?? index}-${stock.code || stock.name}`}
-                        color="geekblue"
-                        style={{ cursor: stock.code ? "pointer" : "default", fontSize: 11 }}
-                        onClick={() => stock.code && router.push(`/stock/${stock.code}`)}
-                      >
-                        {stock.name || stock.code}
-                      </Tag>
+                      <Space key={`${signal.id ?? index}-${stock.code || stock.name}`} size={2}>
+                        <Tag
+                          color="geekblue"
+                          style={{ cursor: stock.code ? "pointer" : "default", fontSize: 11, marginInlineEnd: 0 }}
+                          onClick={() => stock.code && router.push(`/stock/${stock.code}`)}
+                        >
+                          {stock.name || stock.code}
+                        </Tag>
+                        <AddHoldingButton code={stock.code} name={stock.name} source="advisor_signal" compact type="text" />
+                      </Space>
                     ))
                   ) : (
                     <Tag style={{ fontSize: 11 }}>未关联标的</Tag>
