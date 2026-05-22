@@ -8,7 +8,9 @@ import time
 import uuid
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
+from functools import lru_cache
 from json import JSONDecodeError
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -54,6 +56,16 @@ FUND_DAILY_CACHE: dict[str, Any] = {"data": {}, "fetched_at": None, "error": Non
 ETF_SCALE_CACHE: dict[str, Any] = {"data": {}, "fetched_at": None, "data_gaps": []}
 ETF_META_CACHE_TTL_SECONDS = 60 * 60
 
+# 宽基锚定 & 特殊信号 ETF 代码
+ANCHOR_A500_CODE = "560510"      # 中证A500 — 整体趋势锚点
+ANCHOR_REDLI_CODE = "512890"     # 红利低波 — 风险偏好反向指标
+SECURITIES_ETF_CODE = "512880"   # 证券ETF — 牛市发令枪
+
+# 防御/避险方向标记，用于评分规则豁免
+_DEFENSIVE_ROTATION_KEYWORDS = ("避险", "防御")
+# 宽基锚定组标记
+_ANCHOR_POOL_GROUP = "宽基锚定"
+
 ACTION_LABELS = {
     "buy": "买入",
     "add": "加仓",
@@ -64,9 +76,11 @@ ACTION_LABELS = {
 }
 
 SOURCE_POLICY = (
-    "ETF 分析数据来源于 AKShare ETF 行情/K线/净值/折溢价/基金份额接口、行业/概念板块行情与系统已入库的资讯数据；"
+    "ETF 分析数据来源于 Tushare 基金份额接口、AKShare ETF 行情/K线/净值/折溢价/基金份额接口、行业/概念板块行情与系统已入库的资讯数据；"
+    "手动补充资讯必须来自用户核验来源并标记 manual_verified；"
     "数据缺失时明确标注，不得补造；分析结果仅供研究参考，不构成投资建议。"
 )
+ROTATION_POOL_PATH = Path(__file__).resolve().parents[2] / "data" / "etf_rotation_pool.json"
 
 
 # ========== Pydantic 请求模型 ==========
@@ -99,6 +113,21 @@ class EtfAnalysisRunRequest(BaseModel):
     use_llm: bool = True
     lookback_days: int = Field(default=120, ge=30, le=365)
     trigger_type: str = Field(default="manual", max_length=20)
+
+
+class EtfRotationPoolImportRequest(BaseModel):
+    overwrite_existing: bool = False
+
+
+class EtfManualNewsRequest(BaseModel):
+    title: str = Field(min_length=3, max_length=500)
+    content: str | None = Field(default=None, max_length=5000)
+    publish_time: datetime | None = None
+    source: str = Field(default="manual_verified", max_length=50)
+    event_type: str | None = Field(default="ipo", max_length=30)
+    sentiment: str | None = Field(default="positive", max_length=10)
+    sectors: list[str] = Field(default_factory=list, max_length=10)
+    keywords: list[str] = Field(default_factory=list, max_length=30)
 
 
 # ========== 工具函数 ==========
@@ -206,6 +235,57 @@ def _running_etf_task() -> dict[str, Any] | None:
         return None
     rows.sort(key=lambda item: item.get("created_at") or "", reverse=True)
     return rows[0]
+
+
+@lru_cache(maxsize=1)
+def _load_rotation_pool() -> tuple[dict[str, Any], ...]:
+    """读取主流轮动观测 ETF 清单。清单是静态配置，行情仍只来自真实数据源。"""
+    try:
+        raw = json.loads(ROTATION_POOL_PATH.read_text(encoding="utf-8"))
+    except (OSError, JSONDecodeError) as e:
+        logger.warning(f"ETF rotation pool load failed: {e}")
+        return ()
+    items: list[dict[str, Any]] = []
+    for item in raw if isinstance(raw, list) else []:
+        code = _normalize_code(item.get("code"))
+        if not code:
+            continue
+        normalized = dict(item)
+        normalized["code"] = code
+        normalized["sort_order"] = int(_num(normalized.get("sort_order")) or 9999)
+        items.append(normalized)
+    items.sort(key=lambda row: (row.get("sort_order") or 9999, row.get("code") or ""))
+    return tuple(items)
+
+
+def _rotation_pool_map() -> dict[str, dict[str, Any]]:
+    return {item["code"]: item for item in _load_rotation_pool()}
+
+
+def _rotation_meta(code: str | None) -> dict[str, Any]:
+    clean = _normalize_code(code)
+    return _rotation_pool_map().get(clean or "", {})
+
+
+def _rotation_pool_note(meta: dict[str, Any]) -> str:
+    if not meta:
+        return ""
+    parts = [
+        f"清单名称：{meta.get('alias') or meta.get('name') or meta.get('code')}",
+        f"轮动方向：{meta.get('rotation_direction') or '未标注'}",
+        f"观测信号：{meta.get('observation_signal') or '未标注'}",
+        f"基础信息校验：{meta.get('verified_source') or '未标注'} @ {meta.get('verified_at') or '未标注'}",
+    ]
+    return "\n".join(parts)
+
+
+def _watch_sort_key(row: EtfWatchItem) -> tuple[int, str, str]:
+    meta = _rotation_meta(row.code)
+    return (
+        int(meta.get("sort_order") or 9999),
+        str(row.sector or meta.get("group") or "其他"),
+        str(row.code or ""),
+    )
 
 
 # ========== ETF 数据采集（缓存 + Tushare / 东方财富 / AKShare）==========
@@ -687,7 +767,7 @@ async def _refresh_etf_spot_cache() -> dict[str, dict[str, Any]]:
         SPOT_REFRESH_TASK = None
 
 
-async def _fetch_etf_spot_cached(wait_timeout: float = 3.0) -> dict[str, dict[str, Any]]:
+async def _fetch_etf_spot_cached(wait_timeout: float = 3.0, force_refresh: bool = False) -> dict[str, dict[str, Any]]:
     """返回真实 ETF 行情快照；冷启动慢时先返回旧缓存/空值，避免阻塞页面。"""
     global SPOT_REFRESH_TASK
 
@@ -695,13 +775,13 @@ async def _fetch_etf_spot_cached(wait_timeout: float = 3.0) -> dict[str, dict[st
     fetched_at = SPOT_CACHE.get("fetched_at")
     cached = SPOT_CACHE.get("data") or {}
     age = (now - fetched_at).total_seconds() if fetched_at else None
-    if cached and age is not None and age <= SPOT_CACHE_TTL_SECONDS:
+    if not force_refresh and cached and age is not None and age <= SPOT_CACHE_TTL_SECONDS:
         return cached
 
     if SPOT_REFRESH_TASK is None or SPOT_REFRESH_TASK.done():
         SPOT_REFRESH_TASK = asyncio.create_task(_refresh_etf_spot_cache())
 
-    if cached and age is not None and age <= SPOT_STALE_TTL_SECONDS:
+    if not force_refresh and cached and age is not None and age <= SPOT_STALE_TTL_SECONDS:
         return cached
 
     try:
@@ -719,11 +799,11 @@ def _find_column(columns: list[Any], *keywords: str) -> str | None:
     return None
 
 
-async def _fetch_etf_fund_daily_cached() -> dict[str, dict[str, Any]]:
+async def _fetch_etf_fund_daily_cached(force_refresh: bool = False) -> dict[str, dict[str, Any]]:
     """全市场 ETF 净值/折溢价快照，用于资金面和交易安全性评估。"""
     now = datetime.now()
     cached_at = FUND_DAILY_CACHE.get("fetched_at")
-    if cached_at and (now - cached_at).total_seconds() <= ETF_META_CACHE_TTL_SECONDS:
+    if not force_refresh and cached_at and (now - cached_at).total_seconds() <= ETF_META_CACHE_TTL_SECONDS:
         return FUND_DAILY_CACHE.get("data") or {}
     try:
         import akshare as ak
@@ -768,28 +848,109 @@ def _previous_weekday(day: date) -> date:
     return day
 
 
+def _recent_weekdays(end_day: date, count: int) -> list[date]:
+    days: list[date] = []
+    day = end_day
+    while len(days) < count:
+        if day.weekday() < 5:
+            days.append(day)
+        day -= timedelta(days=1)
+    return days
+
+
+async def _fetch_tushare_fund_share() -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Fetch ETF share snapshots from Tushare and derive day-over-day share changes."""
+    token = get_settings().data_source.tushare_token
+    if not token:
+        return {}, ["Tushare token 未配置，基金份额变化使用 AKShare 兜底"]
+    try:
+        import tushare as ts
+    except Exception as e:
+        return {}, [f"Tushare SDK 不可用，基金份额变化使用 AKShare 兜底：{e}"]
+
+    pro = ts.pro_api(token)
+    rows_by_code: dict[str, list[dict[str, Any]]] = {}
+    gaps: list[str] = []
+    for trade_day in _recent_weekdays(_expected_latest_kline_date(), 4):
+        day_text = trade_day.strftime("%Y%m%d")
+        try:
+            df = await asyncio.to_thread(
+                pro.fund_share,
+                trade_date=day_text,
+                fields="ts_code,trade_date,fd_share",
+            )
+        except Exception as e:
+            gaps.append(f"Tushare fund_share {trade_day.isoformat()} 获取失败：{e}")
+            continue
+        if df is None or df.empty:
+            continue
+        for _, item in df.iterrows():
+            code = _normalize_code(item.get("ts_code"))
+            shares_10k = _num(item.get("fd_share"))
+            scale_date = _parse_trade_date(item.get("trade_date"))
+            if not code or shares_10k is None or scale_date is None:
+                continue
+            rows_by_code.setdefault(code, []).append({
+                "code": code,
+                "shares": shares_10k * 10_000,
+                "scale_date": scale_date,
+                "source": "tushare_fund_share",
+            })
+
+    result: dict[str, dict[str, Any]] = {}
+    for code, snapshots in rows_by_code.items():
+        dedup: dict[date, dict[str, Any]] = {}
+        for snapshot in snapshots:
+            dedup[snapshot["scale_date"]] = snapshot
+        ordered = sorted(dedup.values(), key=lambda row: row["scale_date"], reverse=True)
+        latest = ordered[0]
+        prev = ordered[1] if len(ordered) > 1 else {}
+        shares = latest.get("shares")
+        prev_shares = prev.get("shares")
+        share_delta = shares - prev_shares if shares is not None and prev_shares else None
+        share_delta_pct = (share_delta / prev_shares * 100) if share_delta is not None and prev_shares else None
+        result[code] = {
+            **latest,
+            "prev_shares": prev_shares,
+            "share_delta": _round(share_delta, 2),
+            "share_delta_pct": _round(share_delta_pct, 2),
+            "prev_scale_date": prev.get("scale_date"),
+        }
+    return result, gaps if not result else []
+
+
 async def _fetch_sse_scale_for_date(day: date) -> list[dict[str, Any]]:
     import akshare as ak
 
-    df = await asyncio.to_thread(ak.fund_etf_scale_sse, date=day.strftime("%Y%m%d"))
+    try:
+        df = await asyncio.to_thread(ak.fund_etf_scale_sse, date=day.strftime("%Y%m%d"))
+    except KeyError as e:
+        logger.info(f"上交所 ETF 份额 {day.isoformat()} 暂无可解析数据: {e}")
+        return []
     if df is None or df.empty:
+        return []
+    code_col = "基金代码" if "基金代码" in df.columns else _find_column(list(df.columns), "代码")
+    shares_col = "基金份额" if "基金份额" in df.columns else _find_column(list(df.columns), "份额")
+    date_col = "统计日期" if "统计日期" in df.columns else _find_column(list(df.columns), "日期")
+    if not code_col or not shares_col:
+        logger.info(f"上交所 ETF 份额 {day.isoformat()} 返回列不兼容: {list(df.columns)}")
         return []
     rows: list[dict[str, Any]] = []
     for _, item in df.iterrows():
-        code = _normalize_code(item.get("基金代码"))
+        code = _normalize_code(item.get(code_col))
         if not code:
             continue
         rows.append({
             "code": code,
-            "shares": _num(item.get("基金份额")),
-            "scale_date": _parse_trade_date(item.get("统计日期")) or day,
+            "shares": _num(item.get(shares_col)),
+            "scale_date": _parse_trade_date(item.get(date_col)) or day,
             "source": "akshare_fund_etf_scale_sse",
         })
     return rows
 
 
 async def _fetch_latest_sse_scale() -> tuple[dict[str, dict[str, Any]], list[str]]:
-    gaps: list[str] = []
+    attempted_errors: list[str] = []
     latest_rows: list[dict[str, Any]] = []
     latest_day: date | None = None
     day = _expected_latest_kline_date()
@@ -797,7 +958,7 @@ async def _fetch_latest_sse_scale() -> tuple[dict[str, dict[str, Any]], list[str
         try:
             latest_rows = await _fetch_sse_scale_for_date(day)
         except Exception as e:
-            gaps.append(f"上交所 ETF 份额 {day.isoformat()} 获取失败：{e}")
+            attempted_errors.append(f"上交所 ETF 份额 {day.isoformat()} 获取失败：{e}")
             latest_rows = []
         if latest_rows:
             latest_day = day
@@ -805,7 +966,7 @@ async def _fetch_latest_sse_scale() -> tuple[dict[str, dict[str, Any]], list[str
         day = _previous_weekday(day)
 
     if not latest_rows or latest_day is None:
-        return {}, gaps or ["上交所 ETF 份额数据不可用"]
+        return {}, attempted_errors or ["上交所 ETF 份额数据不可用"]
 
     prev_rows: list[dict[str, Any]] = []
     prev_day = _previous_weekday(latest_day)
@@ -833,7 +994,7 @@ async def _fetch_latest_sse_scale() -> tuple[dict[str, dict[str, Any]], list[str
             "share_delta_pct": _round(share_delta_pct, 2),
             "prev_scale_date": prev_map.get(code, {}).get("scale_date"),
         }
-    return result, gaps
+    return result, []
 
 
 async def _fetch_szse_scale() -> tuple[dict[str, dict[str, Any]], list[str]]:
@@ -863,16 +1024,17 @@ async def _fetch_szse_scale() -> tuple[dict[str, dict[str, Any]], list[str]]:
         return {}, [f"深交所 ETF 份额获取失败：{e}"]
 
 
-async def _fetch_etf_scale_cached() -> tuple[dict[str, dict[str, Any]], list[str]]:
+async def _fetch_etf_scale_cached(force_refresh: bool = False) -> tuple[dict[str, dict[str, Any]], list[str]]:
     now = datetime.now()
     cached_at = ETF_SCALE_CACHE.get("fetched_at")
-    if cached_at and (now - cached_at).total_seconds() <= ETF_META_CACHE_TTL_SECONDS:
+    if not force_refresh and cached_at and (now - cached_at).total_seconds() <= ETF_META_CACHE_TTL_SECONDS:
         return ETF_SCALE_CACHE.get("data") or {}, ETF_SCALE_CACHE.get("data_gaps") or []
 
+    tushare_scale, tushare_gaps = await _fetch_tushare_fund_share()
     sse, sse_gaps = await _fetch_latest_sse_scale()
     szse, szse_gaps = await _fetch_szse_scale()
-    merged = {**sse, **szse}
-    gaps = sse_gaps + szse_gaps
+    merged = {**sse, **szse, **tushare_scale}
+    gaps = [] if tushare_scale else (tushare_gaps + sse_gaps + szse_gaps)
     ETF_SCALE_CACHE.update({"data": merged, "fetched_at": now, "data_gaps": gaps})
     return merged, gaps
 
@@ -1014,12 +1176,20 @@ ETF_BOARD_ALIASES: dict[str, list[str]] = {
     "低空经济": ["低空", "航空", "军工", "无人机"],
     "半导体": ["半导体", "芯片", "集成电路", "科创芯片", "电子"],
     "芯片": ["芯片", "半导体", "集成电路", "科创芯片"],
+    "存储芯片": ["存储芯片", "存储", "HBM", "DRAM", "NAND", "半导体", "芯片", "集成电路"],
+    "存储": ["存储", "存储芯片", "HBM", "DRAM", "NAND", "半导体", "芯片", "集成电路"],
+    "HBM": ["HBM", "存储", "存储芯片", "DRAM", "半导体", "芯片"],
     "消费电子": ["消费电子", "电子", "智能", "苹果"],
     "汽车": ["汽车", "新能源车", "智能车", "智能汽车"],
     "电池": ["电池", "锂电", "新能源车", "新能源"],
     "光伏": ["光伏", "新能源", "电力设备"],
     "储能": ["储能", "新能源", "电力设备"],
     "风电": ["风电", "新能源", "电力设备"],
+    "电力": ["电力", "火力发电", "水力发电", "风力发电", "光伏发电", "核力发电", "绿电", "绿色电力", "公用事业", "电能"],
+    "火力发电": ["火力发电", "电力", "公用事业", "能源"],
+    "绿色电力": ["绿色电力", "绿电", "电力", "新能源"],
+    "电网": ["电网", "电网设备", "智能电网", "电力设备", "电力"],
+    "电网设备": ["电网设备", "电网", "智能电网", "电力设备", "电力"],
     "军工": ["军工", "国防", "航空", "航天"],
     "创新药": ["创新药", "医药", "生物医药", "医疗"],
     "医疗": ["医疗", "医药", "生物医药"],
@@ -1036,7 +1206,82 @@ ETF_BOARD_ALIASES: dict[str, list[str]] = {
     "化工": ["化工", "基础化工", "新材料"],
     "白酒": ["白酒", "酒", "食品饮料", "消费"],
     "游戏": ["游戏", "传媒"],
+    # AI 硬件供应链 — MLCC / PCB / 被动元件等子板块映射到电子/半导体，进而关联 AI / 科技硬件方向
+    "MLCC": ["MLCC", "被动元件", "元件", "电子", "半导体"],
+    "PCB": ["PCB", "印制电路板", "电路板", "覆铜板", "电子", "半导体"],
+    "印制电路板": ["印制电路板", "PCB", "电路板", "电子"],
+    "被动元件": ["被动元件", "元件", "MLCC", "电容", "电阻", "电感", "电子"],
+    "元件": ["元件", "被动元件", "MLCC", "电子", "电子元件"],
+    "覆铜板": ["覆铜板", "PCB", "印制电路板", "电子"],
+    "玻纤": ["玻纤", "覆铜板", "PCB", "电子"],
+    "光模块": ["光模块", "CPO", "通信", "5G", "AI", "算力", "云计算"],
+    "CPO": ["CPO", "光模块", "通信", "5G", "AI", "算力"],
 }
+
+ETF_SECTOR_NEWS_ALIASES: dict[str, list[str]] = {
+    "AI / 科技主线": [
+        "AI", "人工智能", "算力", "半导体", "芯片", "存储", "存储芯片", "DRAM", "HBM",
+        "长鑫", "长鑫存储", "长鑫科技", "CXMT", "通信", "光模块", "CPO", "消费电子", "计算机",
+    ],
+    "新能源 / 资源": [
+        "新能源", "新能源车", "锂电", "储能", "光伏", "风电", "电网", "电力设备",
+        "有色", "铜", "铝", "煤炭",
+    ],
+    "大金融 / 消费": ["证券", "券商", "金融", "消费", "内需", "白酒", "食品饮料", "黄金"],
+    "跨市场 / 主题": ["纳指", "美股", "港股", "创新药", "医药", "军工", "机器人", "智能制造"],
+    "备用观测池": ["光伏", "卫星", "商业航天", "低轨卫星", "航天"],
+    "宽基锚定": ["A500", "中证A500", "红利", "低波", "宽基"],
+}
+
+ETF_NAME_SECTOR_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("存储", ("存储", "HBM", "DRAM", "NAND")),
+    ("半导体", ("半导体", "芯片", "集成电路", "科创芯片")),
+    ("通信", ("通信", "5G", "CPO", "光模块")),
+    ("AI", ("AI人工智能", "人工智能", "AI")),
+    ("云计算", ("云计算",)),
+    ("机器人", ("机器人",)),
+    ("电网设备", ("电网设备",)),
+    ("电力", ("电力", "绿电", "绿色电力", "公用事业", "火力发电", "水力发电", "风力发电", "核力发电")),
+    ("电池", ("电池", "锂电")),
+    ("军工", ("军工", "国防", "航空航天")),
+    ("新能源", ("新能源", "新能源车", "光伏", "储能", "风电")),
+)
+
+MARKET_BOARD_EXCLUDE_KEYWORDS = (
+    "昨日",
+    "打板",
+    "连板",
+    "首板",
+    "涨停",
+    "融资融券",
+    "富时罗素",
+    "MSCI",
+    "标准普尔",
+    "深股通",
+    "沪股通",
+    "一季报",
+    "预增",
+    "预减",
+    "扭亏",
+    "高振幅",
+    "转融券",
+)
+
+
+def _infer_etf_sector(name: str | None) -> str | None:
+    text = str(name or "").strip()
+    if not text:
+        return None
+    upper = text.upper()
+    for sector, keywords in ETF_NAME_SECTOR_RULES:
+        if any(keyword.upper() in upper for keyword in keywords):
+            return sector
+    return None
+
+
+def _is_market_board_noise(name: str | None) -> bool:
+    text = str(name or "").strip()
+    return any(keyword in text for keyword in MARKET_BOARD_EXCLUDE_KEYWORDS)
 
 
 def _board_index_kline_industry(name: str) -> Any:
@@ -1055,6 +1300,56 @@ def _normalize_board_name_field(item: dict[str, Any]) -> str:
 
 def _normalize_board_change_pct(item: dict[str, Any]) -> float | None:
     return _num(item.get("涨跌幅") or item.get("change_pct"))
+
+
+def _compound_pct_return(values: list[float], days: int) -> float | None:
+    if len(values) < days:
+        return None
+    acc = 1.0
+    for value in values[-days:]:
+        acc *= 1 + value / 100
+    return _round((acc - 1) * 100, 2)
+
+
+def _latest_to_avg_ratio(values: list[float], lookback: int = 20) -> float | None:
+    if len(values) < lookback + 1:
+        return None
+    avg = _avg(values[-lookback - 1:-1])
+    if not avg:
+        return None
+    return _round(values[-1] / avg, 2)
+
+
+def _sum_recent_values(rows: list[dict[str, Any]], field: str, days: int) -> float | None:
+    values = [_num(row.get(field)) for row in rows[-days:]]
+    values = [value for value in values if value is not None]
+    if not values:
+        return None
+    return _round(sum(values), 2)
+
+
+def _positive_recent_count(rows: list[dict[str, Any]], field: str, days: int) -> int | None:
+    values = [_num(row.get(field)) for row in rows[-days:]]
+    values = [value for value in values if value is not None]
+    if not values:
+        return None
+    return sum(1 for value in values if value > 0)
+
+
+async def _fetch_tushare_paged(method: Any, max_pages: int = 5, **kwargs: Any) -> list[Any]:
+    def _fetch_sync() -> list[Any]:
+        frames: list[Any] = []
+        limit = 5000
+        for page in range(max_pages):
+            df = method(**kwargs, limit=limit, offset=page * limit)
+            if df is None or getattr(df, "empty", True):
+                break
+            frames.append(df)
+            if len(df) < limit:
+                break
+        return frames
+
+    return await asyncio.to_thread(_fetch_sync)
 
 
 async def _fetch_board_index_metrics(name: str, board_type: str) -> dict[str, Any]:
@@ -1086,6 +1381,129 @@ async def _fetch_board_index_metrics(name: str, board_type: str) -> dict[str, An
         if avg:
             vr = _round(volumes[-1] / avg, 2)
     return {"return_5d": r5, "return_20d": r20, "volume_ratio": vr}
+
+
+async def _fetch_market_boards_tushare_raw() -> tuple[list[dict[str, Any]], list[str]]:
+    """用 Tushare 东方财富板块行情/资金流作为市场板块主数据源。"""
+    token = get_settings().data_source.tushare_token
+    if not token:
+        return [], ["Tushare token 未配置，市场板块使用东方财富直连接口兜底"]
+    try:
+        import tushare as ts
+    except Exception as e:
+        return [], [f"Tushare SDK 不可用，市场板块使用东方财富直连接口兜底：{e}"]
+    pro = ts.pro_api(token)
+    gaps: list[str] = []
+    end_day = _expected_latest_kline_date()
+    start_day = end_day - timedelta(days=45)
+    start_text = start_day.strftime("%Y%m%d")
+    end_text = end_day.strftime("%Y%m%d")
+    index_rows: dict[str, list[dict[str, Any]]] = {}
+    for board_type, idx_type in (("industry", "行业板块"), ("concept", "概念板块")):
+        try:
+            frames = await _fetch_tushare_paged(
+                pro.dc_index,
+                idx_type=idx_type,
+                start_date=start_text,
+                end_date=end_text,
+                fields="ts_code,trade_date,name,leading,pct_change,total_mv,turnover_rate,up_num,down_num,idx_type",
+            )
+        except Exception as e:
+            gaps.append(f"Tushare {idx_type} 行情获取失败：{e}")
+            continue
+        if not frames:
+            gaps.append(f"Tushare {idx_type} 行情为空")
+            continue
+        for df in frames:
+            for _, item in df.iterrows():
+                ts_code = str(item.get("ts_code") or "").strip()
+                trade_date = _parse_trade_date(item.get("trade_date"))
+                if not ts_code or trade_date is None:
+                    continue
+                index_rows.setdefault(ts_code, []).append({
+                    "trade_date": trade_date,
+                    "name": str(item.get("name") or "").strip(),
+                    "board_type": board_type,
+                    "change_pct": _num(item.get("pct_change")),
+                    "turnover_rate": _num(item.get("turnover_rate")),
+                    "total_mv": _num(item.get("total_mv")),
+                    "rise_count": int(item.get("up_num") or 0),
+                    "fall_count": int(item.get("down_num") or 0),
+                    "leading_stock": str(item.get("leading") or "").strip() or None,
+                })
+    flow_rows: dict[str, list[dict[str, Any]]] = {}
+    for board_type, content_type in (("industry", "行业"), ("concept", "概念")):
+        try:
+            frames = await _fetch_tushare_paged(
+                pro.moneyflow_ind_dc,
+                content_type=content_type,
+                start_date=start_text,
+                end_date=end_text,
+                fields="trade_date,content_type,ts_code,name,pct_change,net_amount,net_amount_rate,rank",
+            )
+        except Exception as e:
+            gaps.append(f"Tushare {content_type}板块资金流获取失败：{e}")
+            continue
+        if not frames:
+            gaps.append(f"Tushare {content_type}板块资金流为空")
+            continue
+        for df in frames:
+            for _, item in df.iterrows():
+                ts_code = str(item.get("ts_code") or "").strip()
+                trade_date = _parse_trade_date(item.get("trade_date"))
+                if not ts_code or trade_date is None:
+                    continue
+                flow_rows.setdefault(ts_code, []).append({
+                    "trade_date": trade_date,
+                    "name": str(item.get("name") or "").strip(),
+                    "board_type": board_type,
+                    "change_pct": _num(item.get("pct_change")),
+                    "capital_inflow": _num(item.get("net_amount")),
+                    "capital_inflow_rate": _num(item.get("net_amount_rate")),
+                    "capital_inflow_rank": int(item.get("rank") or 0),
+                })
+    boards: list[dict[str, Any]] = []
+    for ts_code, rows in index_rows.items():
+        rows.sort(key=lambda row: row["trade_date"])
+        latest = rows[-1]
+        flow_for_code = sorted(flow_rows.get(ts_code) or [], key=lambda row: row["trade_date"])
+        latest_flow = flow_for_code[-1] if flow_for_code else {}
+        pct_changes = [
+            value for value in (_num(row.get("change_pct")) for row in rows)
+            if value is not None
+        ]
+        turnover_rates = [
+            value for value in (_num(row.get("turnover_rate")) for row in rows)
+            if value is not None
+        ]
+        net_inflow_3d = _sum_recent_values(flow_for_code, "capital_inflow", 3)
+        net_inflow_5d = _sum_recent_values(flow_for_code, "capital_inflow", 5)
+        positive_days_3d = _positive_recent_count(flow_for_code, "capital_inflow", 3)
+        boards.append({
+            "name": latest.get("name") or latest_flow.get("name") or ts_code,
+            "code": ts_code,
+            "board_type": latest.get("board_type"),
+            "change_pct": latest.get("change_pct"),
+            "turnover": None,
+            "turnover_rate": latest.get("turnover_rate"),
+            "turnover_ratio": _latest_to_avg_ratio(turnover_rates, 20),
+            "leading_stock": latest.get("leading_stock"),
+            "volume_ratio": _latest_to_avg_ratio(turnover_rates, 20),
+            "volume_ratio_source": "turnover_rate_ratio",
+            "capital_inflow": latest_flow.get("capital_inflow"),
+            "capital_inflow_rate": latest_flow.get("capital_inflow_rate"),
+            "capital_inflow_rank": latest_flow.get("capital_inflow_rank"),
+            "net_inflow_3d": net_inflow_3d,
+            "net_inflow_5d": net_inflow_5d,
+            "net_inflow_positive_days_3d": positive_days_3d,
+            "rise_count": latest.get("rise_count"),
+            "fall_count": latest.get("fall_count"),
+            "return_5d": _compound_pct_return(pct_changes, 5),
+            "return_20d": _compound_pct_return(pct_changes, 20),
+            "latest_trade_date": _iso_date(latest.get("trade_date")),
+            "source": "tushare_dc_index+moneyflow_ind_dc",
+        })
+    return boards, gaps
 
 
 async def _fetch_market_boards_raw() -> tuple[list[dict[str, Any]], list[str]]:
@@ -1129,9 +1547,11 @@ async def _fetch_market_boards_raw() -> tuple[list[dict[str, Any]], list[str]]:
                 "leading_stock": str(item.get("f128") or "").strip() or None,
                 # 额外字段用于轮动判断
                 "volume_ratio": _num(item.get("f10")),
+                "volume_ratio_source": "eastmoney_volume_ratio",
                 "capital_inflow": _num(item.get("f62")),
                 "rise_count": int(item.get("f104") or 0),
                 "fall_count": int(item.get("f105") or 0),
+                "source": "eastmoney_push2delay",
             })
         return result
 
@@ -1163,7 +1583,11 @@ async def _fetch_market_boards(top_hot: int = 8, top_rotation: int = 8) -> dict[
     if cache_fresh and (cached_data.get("hot_boards") or cached_data.get("rotation_boards")):
         return cached_data
 
-    boards, gaps = await _fetch_market_boards_raw()
+    boards, gaps = await _fetch_market_boards_tushare_raw()
+    if not boards:
+        fallback_boards, fallback_gaps = await _fetch_market_boards_raw()
+        boards = fallback_boards
+        gaps = gaps + fallback_gaps
     if not boards:
         payload = {
             "hot_boards": [],
@@ -1176,23 +1600,35 @@ async def _fetch_market_boards(top_hot: int = 8, top_rotation: int = 8) -> dict[
         return payload
 
     boards.sort(key=lambda b: (b.get("change_pct") if b.get("change_pct") is not None else -999), reverse=True)
+    ranked_boards = [b for b in boards if not _is_market_board_noise(b.get("name"))]
+    if not ranked_boards:
+        ranked_boards = boards
 
     # 热门板块：当日涨幅 TOP N，快照自带量比和资金流向，无需再拉 K 线
     hot_boards: list[dict[str, Any]] = []
-    for b in boards[:top_hot]:
+    for b in ranked_boards[:top_hot]:
         hot_boards.append({
             "name": b["name"],
             "code": b.get("code"),
             "board_type": b.get("board_type"),
             "change_pct": b.get("change_pct"),
             "volume_ratio": b.get("volume_ratio"),
+            "volume_ratio_source": b.get("volume_ratio_source"),
+            "turnover_rate": b.get("turnover_rate"),
+            "turnover_ratio": b.get("turnover_ratio"),
             "capital_inflow": b.get("capital_inflow"),
+            "capital_inflow_rate": b.get("capital_inflow_rate"),
+            "net_inflow_3d": b.get("net_inflow_3d"),
+            "net_inflow_5d": b.get("net_inflow_5d"),
+            "net_inflow_positive_days_3d": b.get("net_inflow_positive_days_3d"),
             "leading_stock": b.get("leading_stock"),
             "turnover": b.get("turnover"),
             "rise_count": b.get("rise_count"),
             "fall_count": b.get("fall_count"),
-            "return_5d": None,   # push2his blocked；留空不影响展示
-            "return_20d": None,
+            "return_5d": b.get("return_5d"),
+            "return_20d": b.get("return_20d"),
+            "source": b.get("source"),
+            "latest_trade_date": b.get("latest_trade_date"),
             "reason": _hot_board_reason(b),
         })
 
@@ -1200,35 +1636,71 @@ async def _fetch_market_boards(top_hot: int = 8, top_rotation: int = 8) -> dict[
     # 这些板块可能是资金悄悄埋伏，下一轮启动候选
     rotation_boards: list[dict[str, Any]] = []
     early_signals: list[str] = []
-    top_change = boards[0].get("change_pct") or 0 if boards else 0
-    for b in boards:
+    top_change = ranked_boards[0].get("change_pct") or 0 if ranked_boards else 0
+    for b in ranked_boards:
         cp = b.get("change_pct") or 0
-        vr = b.get("volume_ratio") or 0
+        vr = b.get("volume_ratio")
+        if vr is None:
+            vr = b.get("turnover_ratio")
+        vr = _num(vr)
         inflow = b.get("capital_inflow") or 0
+        inflow_3d = b.get("net_inflow_3d")
+        positive_days_3d = b.get("net_inflow_positive_days_3d")
+        r5 = b.get("return_5d")
+        r20 = b.get("return_20d")
         rise = b.get("rise_count") or 0
         fall = b.get("fall_count") or 0
-        # 量比放大 + 主力净流入 + 涨幅未超过当日最大涨幅的 60%
-        if vr > 1.2 and inflow > 0 and 0 < cp < top_change * 0.6:
+        inflow_sustained = (
+            (positive_days_3d is not None and positive_days_3d >= 2)
+            or (inflow_3d is not None and inflow_3d > 0 and inflow > 0)
+        )
+        not_overheated = r5 is None or r5 < 8
+        # 极端行情日（top_change > 8%）用固定上限 5%，防止上限随领涨板块水涨船高
+        # 导致所有强势板块都被过滤、轮动列表为空
+        if top_change > 8:
+            change_not_extreme = -1 <= cp <= 5.0
+        else:
+            change_not_extreme = -1 <= cp <= max(4.0, top_change * 0.75)
+        activity_confirmed = vr is None or vr >= 0.9
+        if inflow > 0 and inflow_sustained and change_not_extreme and not_overheated and activity_confirmed:
+            rotation_score = (
+                min(max(vr or 0, 0), 4) * 20
+                + min((inflow_3d or inflow) / 1e8, 120) * 0.35
+                + max(0, cp) * 4
+                + max(0, (r5 or 0)) * 2
+            )
             rotation_boards.append({
                 "name": b["name"],
+                "code": b.get("code"),
                 "board_type": b.get("board_type"),
                 "change_pct": cp,
                 "volume_ratio": _round(vr, 2),
+                "volume_ratio_source": b.get("volume_ratio_source"),
+                "turnover_rate": b.get("turnover_rate"),
+                "turnover_ratio": b.get("turnover_ratio"),
                 "capital_inflow": inflow,
+                "capital_inflow_rate": b.get("capital_inflow_rate"),
+                "net_inflow_3d": inflow_3d,
+                "net_inflow_5d": b.get("net_inflow_5d"),
+                "net_inflow_positive_days_3d": positive_days_3d,
                 "rise_count": rise,
                 "fall_count": fall,
-                "return_5d": None,
-                "return_20d": None,
+                "return_5d": r5,
+                "return_20d": r20,
                 "rotation_type": "rotating_in",
-                "reason": f"量比 {vr}，主力净流入 {_round(inflow / 1e8, 2)}亿，今日涨幅 {cp}% 尚低，资金可能提前布局",
+                "rotation_score": _round(rotation_score, 2),
+                "source": b.get("source"),
+                "latest_trade_date": b.get("latest_trade_date"),
+                "reason": _rotation_board_reason(b),
             })
         # 早期信号：量比高但今日微跌（资金试探性买入？）
-        if vr > 1.5 and -1 < cp < 0 and inflow > 0:
+        if vr is not None and vr > 1.5 and -1 < cp < 0 and inflow > 0:
+            label = "换手放大" if b.get("volume_ratio_source") == "turnover_rate_ratio" else "量比"
             early_signals.append(
-                f"【{b['name']}】今日微跌 {cp}% 但量比达 {vr}，主力净流入 {_round(inflow / 1e8, 2)}亿，疑似底部试探"
+                f"【{b['name']}】今日微跌 {cp}% 但{label}达 {vr}，主力净流入 {_round(inflow / 1e8, 2)}亿，疑似底部试探"
             )
 
-    rotation_boards.sort(key=lambda x: (x.get("volume_ratio") or 0), reverse=True)
+    rotation_boards.sort(key=lambda x: (x.get("rotation_score") or 0), reverse=True)
     rotation_boards = rotation_boards[:top_rotation]
 
     payload = {
@@ -1250,10 +1722,20 @@ def _hot_board_reason(board: dict[str, Any]) -> str:
         parts.append(f"当日 {('+' if cp > 0 else '')}{cp}%")
     vr = board.get("volume_ratio")
     if vr is not None:
-        parts.append(f"量比 {vr}")
+        label = "换手放大" if board.get("volume_ratio_source") == "turnover_rate_ratio" else "量比"
+        parts.append(f"{label} {vr}")
     inflow = board.get("capital_inflow")
     if inflow is not None:
         parts.append(f"主力净流入 {_round(inflow / 1e8, 2)}亿")
+    inflow_3d = board.get("net_inflow_3d")
+    if inflow_3d is not None:
+        parts.append(f"3日净流入 {_round(inflow_3d / 1e8, 2)}亿")
+    r5 = board.get("return_5d")
+    if r5 is not None:
+        parts.append(f"5日 {_pct_basis(r5)}")
+    r20 = board.get("return_20d")
+    if r20 is not None:
+        parts.append(f"20日 {_pct_basis(r20)}")
     rise = board.get("rise_count")
     fall = board.get("fall_count")
     if rise is not None and fall is not None:
@@ -1263,38 +1745,73 @@ def _hot_board_reason(board: dict[str, Any]) -> str:
     return "、".join(parts) if parts else "暂无足够数据"
 
 
+def _rotation_board_reason(board: dict[str, Any]) -> str:
+    parts = []
+    vr = board.get("volume_ratio") or board.get("turnover_ratio")
+    if vr is not None:
+        label = "换手放大" if board.get("volume_ratio_source") == "turnover_rate_ratio" else "量比"
+        parts.append(f"{label} {vr}")
+    inflow = board.get("capital_inflow")
+    if inflow is not None:
+        parts.append(f"当日净流入 {_round(inflow / 1e8, 2)}亿")
+    inflow_3d = board.get("net_inflow_3d")
+    if inflow_3d is not None:
+        days = board.get("net_inflow_positive_days_3d")
+        suffix = f"，近3日{days}日为正" if days is not None else ""
+        parts.append(f"3日净流入 {_round(inflow_3d / 1e8, 2)}亿{suffix}")
+    cp = board.get("change_pct")
+    if cp is not None:
+        parts.append(f"当日 {_pct_basis(cp)}")
+    r5 = board.get("return_5d")
+    if r5 is not None:
+        parts.append(f"5日 {_pct_basis(r5)}")
+    r20 = board.get("return_20d")
+    if r20 is not None:
+        parts.append(f"20日 {_pct_basis(r20)}")
+    return "，".join(parts) if parts else "资金与趋势数据不足，仅作观察"
+
+
 def _fallback_match_etfs_for_board(
     board: dict[str, Any],
     watch_etfs: list[dict[str, Any]],
     top_n: int = 3,
 ) -> list[dict[str, Any]]:
-    """无 LLM 时的关键词匹配：板块名 ↔ ETF name / sector"""
+    """无 LLM 时的关键词匹配：板块名/别名 ↔ ETF name / sector"""
     name = (board.get("name") or "").strip()
     if not name:
         return []
-    keywords: list[str] = [name]
+    exact_keywords: list[str] = [name]
     # 行业板块名末尾常带「设备」「材料」等冗余词，提取 2 字内核更易命中
     if len(name) >= 4:
-        keywords.append(name[:2])
+        exact_keywords.append(name[:2])
     matched: list[dict[str, Any]] = []
     seen_codes: set[str] = set()
     for etf in watch_etfs:
         if etf["code"] in seen_codes:
             continue
         haystack = f"{etf.get('name') or ''} {etf.get('sector') or ''}"
-        if any(kw and kw in haystack for kw in keywords):
-            matched.append({
-                "code": etf["code"],
-                "name": etf.get("name"),
-                "sector": etf.get("sector"),
-                "current_price": etf.get("current_price"),
-                "trend": etf.get("trend"),
-                "score": etf.get("score"),
-                "is_watched": True,
-                "match_reason": f"名称/分组包含「{keywords[0]}」",
-            })
-            seen_codes.add(etf["code"])
-    matched.sort(key=lambda x: x.get("score") or 0, reverse=True)
+        relevance, matched_term = _etf_relevance_for_board(board, haystack, etf.get("sector"))
+        exact_term = next((kw for kw in exact_keywords if kw and kw in haystack), None)
+        if exact_term and relevance < 96:
+            relevance = 96
+            matched_term = exact_term
+        if relevance < 58:
+            continue
+        matched.append({
+            "code": etf["code"],
+            "name": etf.get("name"),
+            "sector": etf.get("sector"),
+            "current_price": etf.get("current_price"),
+            "trend": etf.get("trend"),
+            "score": etf.get("score"),
+            "is_watched": True,
+            "match_reason": f"名称/分组匹配「{matched_term or name}」",
+            "_match_score": relevance,
+        })
+        seen_codes.add(etf["code"])
+    matched.sort(key=lambda x: (x.get("_match_score") or 0, x.get("score") or 0), reverse=True)
+    for item in matched:
+        item.pop("_match_score", None)
     return matched[:top_n]
 
 
@@ -1639,6 +2156,8 @@ def _detect_sector_rotation(per_etf: list[dict[str, Any]]) -> dict[str, Any]:
             label = item.get("name") or item.get("code", "")
             stat: dict[str, Any] = {
                 "sector": label,
+                "code": item.get("code"),
+                "name": label,
                 "etf_count": 1,
                 "avg_return_5d": _round(r5, 2),
                 "avg_return_20d": _round(r20, 2),
@@ -1704,12 +2223,97 @@ def _detect_sector_rotation(per_etf: list[dict[str, Any]]) -> dict[str, Any]:
     rotating_in_g.sort(key=lambda x: x.get("avg_return_5d") or 0, reverse=True)
     rotating_out_g.sort(key=lambda x: x.get("avg_return_5d") or 0)
 
+    # 按 rotation_direction 再做一次细粒度聚合
+    # （比 group 更语义化：同一 group 内可能有防御/进攻不同方向）
+    rotation_dir_map: dict[str, list[dict[str, Any]]] = {}
+    for item in per_etf:
+        rd = item.get("rotation_direction") or item.get("sector") or "其他"
+        rotation_dir_map.setdefault(rd, []).append(item)
+    rotation_direction_stats: list[dict[str, Any]] = []
+    for rd, items in rotation_dir_map.items():
+        r5_vals = [i["technicals"]["return_5d"] for i in items if (i.get("technicals") or {}).get("return_5d") is not None]
+        r20_vals = [i["technicals"]["return_20d"] for i in items if (i.get("technicals") or {}).get("return_20d") is not None]
+        vr_vals = [i["technicals"]["volume_ratio"] for i in items if (i.get("technicals") or {}).get("volume_ratio") is not None]
+        rotation_direction_stats.append({
+            "rotation_direction": rd,
+            "etf_count": len(items),
+            "etf_codes": [i.get("code") for i in items if i.get("code")],
+            "avg_return_5d": _round(_avg(r5_vals) if r5_vals else None, 2),
+            "avg_return_20d": _round(_avg(r20_vals) if r20_vals else None, 2),
+            "avg_volume_ratio": _round(_avg(vr_vals) if vr_vals else None, 2),
+        })
+    rotation_direction_stats.sort(key=lambda x: (x.get("avg_return_5d") or -99), reverse=True)
+
     return {
         "sector_stats": sector_stats_grouped,
         "rotating_in": rotating_in_g[:5],
         "rotating_out": rotating_out_g[:5],
         "early_signals": early_signals_g,
+        "rotation_direction_stats": rotation_direction_stats,
     }
+
+
+def _compute_market_anchor_signal(per_etf: list[dict[str, Any]]) -> dict[str, Any]:
+    """从宽基锚定和证券 ETF 提取市场水位与风险偏好信号。
+    A500（560510）：整体趋势参照；红利低波（512890）：防御资金偏好；证券（512880）：牛市领先指标。
+    """
+    a500 = next((e for e in per_etf if e.get("code") == ANCHOR_A500_CODE), None)
+    redli = next((e for e in per_etf if e.get("code") == ANCHOR_REDLI_CODE), None)
+    securities = next((e for e in per_etf if e.get("code") == SECURITIES_ETF_CODE), None)
+    signal: dict[str, Any] = {}
+
+    if a500:
+        t = a500.get("technicals") or {}
+        signal["a500_trend"] = t.get("trend")
+        signal["a500_return_5d"] = t.get("return_5d")
+        signal["a500_return_20d"] = t.get("return_20d")
+        signal["a500_rsi14"] = t.get("rsi14")
+
+    # 红利低波 vs A500：relative strength 判断风险偏好
+    if redli and a500:
+        r5_redli = (redli.get("technicals") or {}).get("return_5d")
+        r5_a500 = (a500.get("technicals") or {}).get("return_5d")
+        if r5_redli is not None and r5_a500 is not None:
+            gap = _round(r5_redli - r5_a500, 2)
+            signal["redli_vs_a500_5d"] = gap
+            if gap > 1.5:
+                signal["risk_mode"] = "risk_off"
+                signal["risk_mode_reason"] = (
+                    f"红利低波5日跑赢中证A500 {gap}pct，防御资金主导，市场风险偏好下降；"
+                    "成长/科技方向需谨慎追高，宽基支撑参考 A500 趋势"
+                )
+            elif gap < -2.0:
+                signal["risk_mode"] = "risk_on"
+                signal["risk_mode_reason"] = (
+                    f"中证A500显著强于红利低波（差距{abs(gap)}pct），市场风险偏好较高；"
+                    "成长/科技/AI 方向占优，关注 AI/科技硬件与应用轮动节奏"
+                )
+            else:
+                signal["risk_mode"] = "neutral"
+                signal["risk_mode_reason"] = "宽基与红利相对强弱均衡，市场风格中性，关注分方向量比分化"
+
+    # 证券ETF：牛市发令枪——放量上涨=增量资金入场
+    if securities:
+        t_sec = securities.get("technicals") or {}
+        q_sec = securities.get("quote") or {}
+        vr_sec = t_sec.get("volume_ratio")
+        cp_sec = _num(q_sec.get("change_pct"))
+        r5_sec = t_sec.get("return_5d")
+        if vr_sec is not None and cp_sec is not None:
+            if vr_sec > 1.3 and cp_sec > 0 and (r5_sec or 0) > 0:
+                signal["securities_etf_signal"] = "bullish"
+                signal["securities_etf_reason"] = (
+                    f"证券ETF量比{_round(vr_sec, 2)}、当日+{_round(cp_sec, 2)}%"
+                    + (f"、5日+{_round(r5_sec, 2)}%" if r5_sec else "")
+                    + "；牛市发令枪亮起，增量资金入场信号，可适当提升进攻型 ETF 仓位"
+                )
+            elif vr_sec > 1.2 and cp_sec < -1:
+                signal["securities_etf_signal"] = "warning"
+                signal["securities_etf_reason"] = (
+                    f"证券ETF量比{_round(vr_sec, 2)}但当日跌{_round(abs(cp_sec), 2)}%，"
+                    "市场情绪偏谨慎，短期控制进攻型仓位"
+                )
+    return signal
 
 
 # ========== 新闻情绪关联 ==========
@@ -1731,8 +2335,17 @@ async def _fetch_sector_news(db: AsyncSession, sectors: list[str], days: int = 7
     result: dict[str, list[dict[str, Any]]] = {sector: [] for sector in sectors}
     for row in rows:
         text = f"{row.title or ''} {row.content or ''}"
+        related = row.related_codes or {}
+        related_sectors = related.get("sectors") if isinstance(related, dict) else []
+        related_keywords = related.get("keywords") if isinstance(related, dict) else []
         for sector in sectors:
-            if sector and sector in text:
+            keywords = [sector, *ETF_SECTOR_NEWS_ALIASES.get(sector, [])]
+            matched_by_meta = sector in (related_sectors or [])
+            matched_by_keyword = any(kw and kw in text for kw in keywords)
+            matched_by_related_keyword = any(
+                kw and kw in keywords for kw in (related_keywords or [])
+            )
+            if matched_by_meta or matched_by_keyword or matched_by_related_keyword:
                 if len(result[sector]) < 5:
                     result[sector].append({
                         "title": row.title,
@@ -1740,6 +2353,7 @@ async def _fetch_sector_news(db: AsyncSession, sectors: list[str], days: int = 7
                         "sentiment": row.sentiment,
                         "event_type": row.event_type,
                         "source": row.source,
+                        "matched_keywords": [kw for kw in keywords if kw and kw in text][:5],
                     })
     return result
 
@@ -1870,10 +2484,10 @@ def _score_valuation(t: dict[str, Any]) -> float:
     return 20.0
 
 
-def _decide_action(score: float, trend: str) -> str:
-    if score >= 75 and trend == "up":
+def _decide_action(score: float, trend: str, buy_threshold: float = 75, add_threshold: float = 65) -> str:
+    if score >= buy_threshold and trend == "up":
         return "buy"
-    if score >= 65:
+    if score >= add_threshold:
         return "add" if trend == "up" else "watch"
     if score >= 50:
         return "hold"
@@ -1882,7 +2496,12 @@ def _decide_action(score: float, trend: str) -> str:
     return "reduce" if trend == "down" else "avoid"
 
 
-def _rule_analysis_one(item: dict[str, Any], sector_score: float, news_score: float) -> dict[str, Any]:
+def _rule_analysis_one(
+    item: dict[str, Any],
+    sector_score: float,
+    news_score: float,
+    risk_mode: str = "neutral",
+) -> dict[str, Any]:
     t = item["technicals"]
     quote = item.get("quote") or {}
     current_price = t.get("latest_close")
@@ -1892,13 +2511,37 @@ def _rule_analysis_one(item: dict[str, Any], sector_score: float, news_score: fl
     vol = _score_volume(t)
     fund = _score_fund_flow(item)
     val = _score_valuation(t)
+
+    rotation_direction = item.get("rotation_direction") or ""
+    pool_group = item.get("pool_group") or ""
+
+    # 宽基锚定：估值位置意义弱（它们是市场水位参照，不是轮动标的），给中性分
+    if pool_group == _ANCHOR_POOL_GROUP:
+        val = 55.0
+    # 避险/防御方向（红利低波、黄金）：高价格位置不代表追高风险，放宽估值惩罚
+    elif any(kw in rotation_direction for kw in _DEFENSIVE_ROTATION_KEYWORDS):
+        val = max(val, 55.0)
+
     total = tech * 0.25 + vol * 0.10 + fund * 0.15 + sector_score * 0.20 + news_score * 0.10 + val * 0.20
-    action = _decide_action(total, t.get("trend") or "consolidation")
+    # risk_on（证券ETF放量、A500趋势向上）降低入场门槛；risk_off 提高
+    if risk_mode == "risk_on":
+        buy_threshold, add_threshold = 70.0, 62.0
+    elif risk_mode == "risk_off":
+        buy_threshold, add_threshold = 78.0, 68.0
+    else:
+        buy_threshold, add_threshold = 75.0, 65.0
+    action = _decide_action(total, t.get("trend") or "consolidation", buy_threshold, add_threshold)
     return {
         "code": item["code"],
         "name": item.get("name"),
+        "alias": item.get("alias"),
         "sector": item.get("sector"),
+        "pool_group": item.get("pool_group"),
+        "rotation_direction": item.get("rotation_direction"),
+        "observation_signal": item.get("observation_signal"),
+        "sort_order": item.get("sort_order"),
         "current_price": _round(current_price, 3),
+        "change_pct": _round(_num(quote.get("change_pct")), 2),
         "trend": t.get("trend"),
         "scores": {
             "technical": _round(tech, 1),
@@ -1914,34 +2557,340 @@ def _rule_analysis_one(item: dict[str, Any], sector_score: float, news_score: fl
     }
 
 
-def _build_recommendations(per_etf_analysis: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """从分析结果中筛选 buy/add 信号，构造入场价/止盈/止损/仓位建议"""
-    candidates = [a for a in per_etf_analysis if a.get("action") in ("buy", "add") and a.get("current_price")]
-    candidates.sort(key=lambda x: x.get("score") or 0, reverse=True)
-    top = candidates[:5]
-    if not top:
-        return []
-    # 仓位分配：top 越靠前权重越大；总仓位上限 60%
+def _rotation_out_keys(rotation: dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    for item in rotation.get("rotating_out") or []:
+        for key in ("sector", "code", "name"):
+            value = item.get(key)
+            if value:
+                keys.add(str(value))
+    return keys
+
+
+def _apply_short_term_risk_gate(analysis: dict[str, Any], rotation_out_keys: set[str]) -> dict[str, Any]:
+    technicals = analysis.get("technicals") or {}
+    keys = {
+        str(value)
+        for value in (analysis.get("sector"), analysis.get("code"), analysis.get("name"))
+        if value
+    }
+    is_rotating_out = bool(keys & rotation_out_keys)
+    return_5d = _num(technicals.get("return_5d"))
+    change_pct = _num(analysis.get("change_pct"))
+    risk_reasons: list[str] = []
+    if is_rotating_out and return_5d is not None and return_5d < 0:
+        risk_reasons.append(f"板块处于轮出名单且5日收益{return_5d}%")
+    if change_pct is not None and change_pct <= -3:
+        risk_reasons.append(f"当日跌幅{change_pct}%")
+    # 持仓硬止损门控：持仓浮亏超过 -8% 必须提示，无论技术信号如何
+    is_holding = analysis.get("is_holding")
+    cost_price = _num(analysis.get("cost_price"))
+    current_price = _num(analysis.get("current_price"))
+    if is_holding and cost_price and current_price and cost_price > 0:
+        unrealized_pct = (current_price / cost_price - 1) * 100
+        if unrealized_pct <= -8:
+            risk_reasons.append(
+                f"持仓浮亏{_round(unrealized_pct, 1)}%（成本{cost_price}，现价{current_price}），触发持仓止损阈值"
+            )
+    if not risk_reasons:
+        return analysis
+
+    gated = dict(analysis)
+    gated["risk_gate"] = "short_term_weakness"
+    gated["risk_gate_reason"] = "；".join(risk_reasons)
+    gated["score_before_gate"] = analysis.get("score")
+    gated["score"] = _round(min(_num(analysis.get("score")) or 0, 49.9), 1)
+    gated["action"] = "watch"
+    gated["action_label"] = ACTION_LABELS["watch"]
+    scores = dict(gated.get("scores") or {})
+    scores["risk_gate"] = 0
+    gated["scores"] = scores
+    return gated
+
+
+def _bounded_support_price(price: float, raw: float | None, fallback_ratio: float) -> float:
+    fallback = price * fallback_ratio
+    if raw is None or raw <= 0:
+        return fallback
+    lower = price * 0.92
+    upper = price * 0.995
+    return max(lower, min(raw, upper))
+
+
+def _price_text(value: float | None) -> str:
+    return "-" if value is None else f"{value:.3f}"
+
+
+def _derive_entry_price(price: float, technicals: dict[str, Any], trend: str | None) -> float:
+    ma5 = _num(technicals.get("ma5"))
+    ma10 = _num(technicals.get("ma10"))
+    ma20 = _num(technicals.get("ma20"))
+    if trend == "up":
+        raw = ma5 * 1.003 if ma5 and ma5 < price else None
+        return _round(_bounded_support_price(price, raw, 0.99), 3) or _round(price * 0.99, 3) or price
+    raw = None
+    for level in (ma10, ma20):
+        if level and level < price:
+            raw = level * 1.003
+            break
+    return _round(_bounded_support_price(price, raw, 0.98), 3) or _round(price * 0.98, 3) or price
+
+
+def _derive_pullback_add_price(price: float, technicals: dict[str, Any], entry_price: float) -> float:
+    ma20 = _num(technicals.get("ma20"))
+    ma10 = _num(technicals.get("ma10"))
+    raw = None
+    for level in (ma20, ma10):
+        if level and level < entry_price:
+            raw = level * 1.003
+            break
+    return _round(_bounded_support_price(price, raw, 0.965), 3) or _round(price * 0.965, 3) or price
+
+
+def _derive_target_price(price: float, technicals: dict[str, Any]) -> float:
+    high_60d = _num(technicals.get("high_60d"))
+    target = price * 1.08
+    if high_60d and high_60d > price:
+        target = max(price * 1.05, high_60d * 0.995)
+    return _round(target, 3) or price
+
+
+def _derive_stop_loss_price(price: float, technicals: dict[str, Any]) -> float:
+    ma20 = _num(technicals.get("ma20"))
+    ma60 = _num(technicals.get("ma60"))
+    raw = None
+    for level in (ma20, ma60):
+        if level and level < price:
+            raw = level * 0.985
+            break
+    fallback = price * 0.95
+    if raw is None:
+        return _round(fallback, 3) or fallback
+    lower = price * 0.92
+    upper = price * 0.985
+    return _round(max(lower, min(raw, upper)), 3) or fallback
+
+
+def _ma_values(technicals: dict[str, Any]) -> dict[str, float | None]:
+    return {
+        "ma5": _round(_num(technicals.get("ma5")), 3),
+        "ma10": _round(_num(technicals.get("ma10")), 3),
+        "ma20": _round(_num(technicals.get("ma20")), 3),
+        "ma60": _round(_num(technicals.get("ma60")), 3),
+    }
+
+
+def _separate_pullback_and_stop(
+    price: float,
+    entry_price: float,
+    pullback_price: float,
+    stop_loss_price: float,
+) -> tuple[float, float]:
+    """Ensure add-on support and stop-loss are actionable, distinct levels."""
+    min_pullback_gap = 0.012
+    min_stop_gap = 0.025
+    if pullback_price >= entry_price * (1 - min_pullback_gap):
+        pullback_price = entry_price * (1 - min_pullback_gap)
+    pullback_price = max(price * 0.90, min(pullback_price, entry_price * 0.995))
+
+    max_stop = pullback_price * (1 - min_stop_gap)
+    if stop_loss_price >= max_stop:
+        stop_loss_price = max_stop
+    stop_loss_price = max(price * 0.86, min(stop_loss_price, max_stop))
+    return _round(pullback_price, 3) or pullback_price, _round(stop_loss_price, 3) or stop_loss_price
+
+
+def _build_tomorrow_plan(
+    item: dict[str, Any],
+    position_pct: float,
+    entry_price: float,
+    target_price: float,
+    stop_loss_price: float,
+) -> dict[str, Any]:
+    technicals = item.get("technicals") or {}
+    ma = _ma_values(technicals)
+    score = _num(item.get("score")) or 0
+    trend = item.get("trend")
+    first_ratio = 0.6 if trend == "up" and score >= 75 else 0.5 if trend == "up" else 0.4
+    initial_add_pct = _round(position_pct * first_ratio, 1) or 0
+    pullback_add_pct = _round(max(position_pct - initial_add_pct, 0), 1) or 0
+    reduce_pct = _round(position_pct * 0.5, 1) or 0
+    current_price = _num(item.get("current_price")) or entry_price
+    pullback_price = _derive_pullback_add_price(current_price, technicals, entry_price)
+    pullback_price, stop_loss_price = _separate_pullback_and_stop(
+        current_price,
+        entry_price,
+        pullback_price,
+        stop_loss_price,
+    )
+    ma_basis = " / ".join(
+        f"{key.upper()}={_price_text(value)}" for key, value in ma.items() if value is not None
+    )
+    if not ma_basis:
+        ma_basis = "均线数据不足，使用现价比例规则"
+    primary = (
+        f"明日不高于{_price_text(entry_price)}先补{initial_add_pct:.1f}%，"
+        f"回踩{_price_text(pullback_price)}再补{pullback_add_pct:.1f}%；"
+        f"冲高至{_price_text(target_price)}减{reduce_pct:.1f}%，"
+        f"跌破{_price_text(stop_loss_price)}减{position_pct:.1f}%。"
+    )
+    return {
+        "reference_trade_date": technicals.get("latest_trade_date"),
+        "basis": "moving_average" if any(value is not None for value in ma.values()) else "price_ratio",
+        "moving_averages": ma,
+        "target_position_pct": _round(position_pct, 1),
+        "add_price": entry_price,
+        "initial_add_position_pct": initial_add_pct,
+        "pullback_add_price": pullback_price,
+        "pullback_add_position_pct": pullback_add_pct,
+        "reduce_price": target_price,
+        "reduce_position_pct": reduce_pct,
+        "stop_loss_price": stop_loss_price,
+        "stop_reduce_position_pct": _round(position_pct, 1),
+        "ma_basis": ma_basis,
+        "primary": primary,
+    }
+
+
+def _build_recommendation_rows(
+    top: list[dict[str, Any]],
+    total_position_cap: float,
+    allocation_mode: str,
+    forced_action: str | None = None,
+) -> list[dict[str, Any]]:
     total_weight = sum((c.get("score") or 0) for c in top) or 1.0
     recommendations: list[dict[str, Any]] = []
     for c in top:
-        price = c["current_price"]
+        price = _num(c["current_price"])
+        if price is None:
+            continue
         weight = (c.get("score") or 0) / total_weight
-        position_pct = round(60 * weight, 1)
+        position_pct = round(total_position_cap * weight, 1)
+        technicals = c.get("technicals") or {}
+        entry_price = _derive_entry_price(price, technicals, c.get("trend"))
+        target_price = _derive_target_price(price, technicals)
+        stop_loss_price = _derive_stop_loss_price(price, technicals)
+        tomorrow_plan = _build_tomorrow_plan(c, position_pct, entry_price, target_price, stop_loss_price)
+        stop_loss_price = tomorrow_plan["stop_loss_price"]
+        scores = c.get("scores") or {}
+        action = forced_action or c["action"]
+        reason_parts = []
+        if allocation_mode == "watch_pullback":
+            reason_parts.append("暂未达买入阈值，建议轻仓等回踩")
+        trend_label = {"up": "上升趋势", "down": "下降趋势", "consolidation": "震荡整理"}.get(c.get("trend") or "", "")
+        score_desc = f"综合评分 {c.get('score')}"
+        if trend_label:
+            score_desc += f"（{trend_label}）"
+        reason_parts.append(score_desc)
+        score_highlights = []
+        tech_s = scores.get("technical")
+        if tech_s is not None and tech_s >= 65:
+            score_highlights.append(f"技术面偏强 {tech_s}")
+        fund_s = scores.get("fund_flow")
+        if fund_s is not None and fund_s >= 65:
+            score_highlights.append(f"资金面偏强 {fund_s}")
+        sec_s = scores.get("sector_rotation")
+        if sec_s is not None and sec_s >= 65:
+            score_highlights.append(f"板块热度 {sec_s}")
+        val_s = scores.get("valuation")
+        if val_s is not None and val_s >= 65:
+            score_highlights.append(f"估值偏低 {val_s}")
+        if score_highlights:
+            reason_parts.append("、".join(score_highlights))
+        # 止盈止损概要
+        reason_parts.append(f"目标 {_price_text(target_price)}，止损 {_price_text(stop_loss_price)}")
         recommendations.append({
             "code": c["code"],
             "name": c.get("name"),
             "sector": c.get("sector"),
-            "action": c["action"],
-            "action_label": c.get("action_label"),
+            "action": action,
+            "action_label": ACTION_LABELS.get(action, action),
             "score": c.get("score"),
             "current_price": price,
-            "entry_price": _round(price * 0.99, 3),
-            "target_price": _round(price * 1.08, 3),
-            "stop_loss_price": _round(price * 0.95, 3),
+            "change_pct": c.get("change_pct"),
+            "is_holding": c.get("is_holding"),
+            "cost_price": c.get("cost_price"),
+            "quantity": c.get("quantity"),
+            "entry_price": entry_price,
+            "target_price": target_price,
+            "stop_loss_price": stop_loss_price,
             "position_pct": position_pct,
-            "reason": f"综合评分 {c.get('score')}，{c.get('trend')} 趋势，板块/技术/量能资金多维共振",
+            "allocation_mode": allocation_mode,
+            "moving_averages": tomorrow_plan["moving_averages"],
+            "tomorrow_plan": tomorrow_plan,
+            "reason": "；".join(reason_parts),
         })
+    return recommendations
+
+
+def _build_recommendations(per_etf_analysis: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """构造明日配置：优先买入/加仓；若无高置信信号，则给轻仓观察方案。"""
+    candidates = [
+        a for a in per_etf_analysis
+        if a.get("action") in ("buy", "add") and a.get("current_price") and not a.get("risk_gate")
+    ]
+    candidates.sort(key=lambda x: x.get("score") or 0, reverse=True)
+    if candidates:
+        return _build_recommendation_rows(candidates[:5], total_position_cap=60, allocation_mode="active")
+
+    watch_candidates: list[dict[str, Any]] = []
+    for item in per_etf_analysis:
+        technicals = item.get("technicals") or {}
+        change_pct = _num(item.get("change_pct"))
+        return_5d = _num(technicals.get("return_5d"))
+        if item.get("risk_gate") or not item.get("current_price"):
+            continue
+        if item.get("trend") != "up" or (_num(item.get("score")) or 0) < 50:
+            continue
+        if return_5d is None or return_5d <= 0:
+            continue
+        # 当日已经大涨的标的只放进观察列表，不进入明日配置，避免追高。
+        if change_pct is not None and change_pct >= 6:
+            continue
+        watch_candidates.append(item)
+
+    watch_candidates.sort(key=lambda x: x.get("score") or 0, reverse=True)
+    return _build_recommendation_rows(
+        watch_candidates[:3],
+        total_position_cap=20,
+        allocation_mode="watch_pullback",
+        forced_action="watch",
+    )
+
+
+def _enrich_recommendations_with_board_context(
+    recommendations: list[dict[str, Any]],
+    market_boards: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """为每条推荐匹配最相关的市场板块，补充 matched_board / board_context，并前置到 reason。"""
+    all_boards = (market_boards.get("hot_boards") or []) + (market_boards.get("rotation_boards") or [])
+    if not all_boards:
+        return recommendations
+    for rec in recommendations:
+        haystack = " ".join(filter(None, [rec.get("name"), rec.get("sector"), rec.get("rotation_direction")]))
+        best_board: dict[str, Any] | None = None
+        best_rel = 57.0
+        for board in all_boards:
+            rel, _ = _etf_relevance_for_board(board, haystack, None)
+            if rel > best_rel:
+                best_rel = rel
+                best_board = board
+        if not best_board:
+            continue
+        cp = best_board.get("change_pct")
+        r5 = best_board.get("return_5d")
+        inflow_3d = best_board.get("net_inflow_3d")
+        parts = [f"热门板块「{best_board['name']}」"]
+        if cp is not None:
+            parts.append(f"今日{_pct_basis(cp)}")
+        if r5 is not None:
+            parts.append(f"5日{_pct_basis(r5)}")
+        if inflow_3d is not None and inflow_3d != 0:
+            parts.append(f"3日净流入{_round(inflow_3d / 1e8, 2)}亿")
+        board_ctx = "；".join(parts)
+        rec["matched_board"] = best_board.get("name")
+        rec["board_context"] = board_ctx
+        rec["reason"] = board_ctx + "；" + rec.get("reason", "")
     return recommendations
 
 
@@ -1958,19 +2907,176 @@ def _summarize(hot_sectors: list[dict[str, Any]], rotation: dict[str, Any], recs
     if rotation.get("early_signals"):
         parts.append(f"轮动早期信号 {len(rotation['early_signals'])} 条，关注潜在反转板块")
     if recs:
-        parts.append(f"备选买入 {len(recs)} 只 ETF，最高分 {recs[0]['name'] or recs[0]['code']}（{recs[0]['score']}）")
+        label = "轻仓观察候选" if all(r.get("allocation_mode") == "watch_pullback" for r in recs) else "备选买入"
+        parts.append(f"{label} {len(recs)} 只 ETF，最高分 {recs[0]['name'] or recs[0]['code']}（{recs[0]['score']}）")
     parts.append(f"本次共分析 {etf_count} 只 ETF。")
     return "；".join(parts)
+
+
+async def _build_historical_context(
+    db: AsyncSession,
+    lookback_sessions: int = 6,
+) -> dict[str, Any]:
+    """查询近 N 次历史分析记录，为每只 ETF 和每个轮动方向计算历史趋势指标。
+    返回结构：
+      per_code: {code -> {score_history, score_trend, score_delta, consecutive_buy_sessions}}
+      direction_consecutive: {direction -> consecutive_rotating_in_sessions}
+      direction_heat_trend: {direction -> "rising"|"stable"|"falling"}
+    """
+    recent_records = (
+        await db.execute(
+            select(EtfAnalysisRecord)
+            .order_by(desc(EtfAnalysisRecord.analysis_time), desc(EtfAnalysisRecord.id))
+            .limit(lookback_sessions)
+        )
+    ).scalars().all()
+
+    if not recent_records:
+        return {"per_code": {}, "direction_consecutive": {}, "direction_heat_trend": {}}
+
+    # 按时间从新到旧排好（查询已是降序）
+    code_sessions: dict[str, list[dict[str, Any]]] = {}
+    # 每个 session 记录 rotating_in 方向集合
+    direction_in_sessions: list[set[str]] = []
+    # 每个 session 每个 rotation_direction 的平均5日涨幅（用于方向热度趋势）
+    direction_r5_sessions: list[dict[str, float]] = []
+
+    for record in recent_records:
+        payload = _record_payload(record)
+        session_date = (payload.get("analysis_time") or "")[:10]
+
+        # 从 individual_analysis 提取每只 ETF 的评分快照
+        for item in payload.get("individual_analysis") or []:
+            code = _normalize_code(item.get("code"))
+            if not code:
+                continue
+            code_sessions.setdefault(code, []).append({
+                "date": session_date,
+                "score": _num(item.get("score")),
+                "action": item.get("action"),
+                "trend": item.get("trend"),
+            })
+
+        # 从 rotation_signals 提取 rotating_in 方向集合
+        in_directions: set[str] = set()
+        rotation_sigs = payload.get("rotation_signals") or {}
+        for s in rotation_sigs.get("rotating_in") or []:
+            for key in ("rotation_direction", "sector", "name"):
+                val = s.get(key)
+                if val:
+                    in_directions.add(str(val))
+        direction_in_sessions.append(in_directions)
+
+        # 从 rotation_direction_stats 提取方向热度（5日均涨幅）
+        rd_r5: dict[str, float] = {}
+        for rd_stat in rotation_sigs.get("rotation_direction_stats") or []:
+            rd = rd_stat.get("rotation_direction")
+            r5 = _num(rd_stat.get("avg_return_5d"))
+            if rd and r5 is not None:
+                rd_r5[rd] = r5
+        direction_r5_sessions.append(rd_r5)
+
+    # ── 1. 每只 ETF 历史趋势 ──────────────────────────────────────────────
+    per_code: dict[str, dict[str, Any]] = {}
+    for code, sessions in code_sessions.items():
+        # sessions 是从新到旧
+        scores = [s["score"] for s in sessions if s.get("score") is not None]
+        actions = [s.get("action") for s in sessions]
+
+        # 评分趋势：最近1次 vs 历史均值
+        score_trend = "stable"
+        score_delta: float | None = None
+        if len(scores) >= 2:
+            score_delta = _round(scores[0] - scores[-1], 1)
+            avg_older = _avg(scores[1:])
+            if avg_older is not None:
+                if scores[0] - avg_older > 3:
+                    score_trend = "rising"
+                elif scores[0] - avg_older < -3:
+                    score_trend = "falling"
+
+        # 连续买入/加仓次数（最近连续几次 action 在 buy/add）
+        consecutive_buy = 0
+        for action in actions:
+            if action in ("buy", "add"):
+                consecutive_buy += 1
+            else:
+                break
+
+        # 连续持有推荐次数（buy/add/hold 均算）
+        consecutive_hold = 0
+        for action in actions:
+            if action in ("buy", "add", "hold"):
+                consecutive_hold += 1
+            else:
+                break
+
+        per_code[code] = {
+            "score_history": sessions[:5],  # 最多保留 5 次，从新到旧
+            "score_trend": score_trend,
+            "score_delta": score_delta,
+            "consecutive_buy_sessions": consecutive_buy,
+            "consecutive_hold_sessions": consecutive_hold,
+        }
+
+    # ── 2. 轮动方向连续进入次数 ──────────────────────────────────────────
+    all_directions: set[str] = set()
+    for s in direction_in_sessions:
+        all_directions.update(s)
+
+    direction_consecutive: dict[str, int] = {}
+    for direction in all_directions:
+        count = 0
+        for session_set in direction_in_sessions:
+            if direction in session_set:
+                count += 1
+            else:
+                break
+        direction_consecutive[direction] = count
+
+    # ── 3. 方向热度趋势（r5 均值从新到旧是升还是降）────────────────────
+    direction_heat_trend: dict[str, str] = {}
+    all_rd = set()
+    for rd_dict in direction_r5_sessions:
+        all_rd.update(rd_dict.keys())
+    for rd in all_rd:
+        r5_vals = [d[rd] for d in direction_r5_sessions if rd in d]
+        if len(r5_vals) >= 2:
+            diff = r5_vals[0] - _avg(r5_vals[1:])
+            if diff > 1.0:
+                direction_heat_trend[rd] = "rising"
+            elif diff < -1.0:
+                direction_heat_trend[rd] = "falling"
+            else:
+                direction_heat_trend[rd] = "stable"
+
+    return {
+        "per_code": per_code,
+        "direction_consecutive": direction_consecutive,
+        "direction_heat_trend": direction_heat_trend,
+    }
 
 
 def _llm_prompt() -> str:
     return (
         "你是一名 ETF 板块轮动研究员。基于用户提供的真实 ETF K线/行情/板块统计/资讯数据，"
-        "给出板块轮动方向研判、热门板块排序、买入备选建议（含入场价/止盈/止损/仓位）和风险提示。"
+        "每只 ETF 是一个资金轮动方向的观测窗口。请重点结合以下四层信息进行判断：\n"
+        "1) market_anchor：A500 趋势（整体水位）+ 红利低波 vs A500（risk_mode 风险偏好）"
+        "+ 证券ETF信号（securities_etf_signal，牛市发令枪）；\n"
+        "2) rotation_direction_stats：8大轮动方向按5日涨幅排序的相对强弱；\n"
+        "3) 每只 ETF 的 rotation_direction（轮动方向）与 observation_signal（该方向的具体观测逻辑）；\n"
+        "4) historical_context：direction_consecutive（各方向连续进入 rotating_in 的次数）和 "
+        "direction_heat_trend（方向热度趋势 rising/stable/falling）；"
+        "direction_consecutive≥3 视为主升浪方向，可在 rotation_forecast 中标注 high confidence；"
+        "individual_analysis 中的 consecutive_buy_sessions≥3 表示该 ETF 已连续推荐买入，"
+        "score_trend=rising 表示评分持续提升。\n"
+        "判断规则提示：防御/避险类 ETF（红利、黄金）热度高 = 风险偏好下降信号，不等于进攻方向买点；"
+        "宽基 ETF（A500）是水位参照，不作为轮动标的推荐。\n"
         "禁止编造未提供的数据。请严格输出 JSON，字段："
         "summary(摘要), hot_sectors(数组, 含sector/score/reason), "
         "rotation_forecast(数组, 含sector/direction[in/out]/confidence/reason), "
-        "buy_suggestions(数组, 含code/name/sector/entry_price/target_price/stop_loss_price/position_pct/reason), "
+        "buy_suggestions(数组, 只能从 individual_analysis 中 action 为 buy/add 的 ETF 里选择，"
+        "含code/name/sector/entry_price/target_price/stop_loss_price/position_pct/reason), "
         "risk_warnings(数组)。"
         "不要输出 data_gaps 字段，数据质量信息由系统规则处理。"
     )
@@ -1990,19 +3096,40 @@ def _sanitize_llm_buy_suggestions(
         if not code or code in seen or code not in code_map:
             continue
         base = code_map[code]
+        if base.get("action") not in {"buy", "add"}:
+            continue
         action = str(item.get("action") or "buy")
         if action not in ACTION_LABELS:
             action = "buy"
+        technicals = base.get("technicals") or {}
+        current_price = _round(_num(base.get("current_price")), 3)
+        price_for_rules = current_price or _num(item.get("entry_price")) or _num(item.get("target_price"))
+        if price_for_rules is None:
+            continue
+        position_pct = _round(_num(item.get("position_pct")), 1) or 10.0
+        entry_price = _round(_num(item.get("entry_price")), 3) or _derive_entry_price(price_for_rules, technicals, base.get("trend"))
+        target_price = _round(_num(item.get("target_price")), 3) or _derive_target_price(price_for_rules, technicals)
+        stop_loss_price = _round(_num(item.get("stop_loss_price")), 3) or _derive_stop_loss_price(price_for_rules, technicals)
+        plan_base = dict(base)
+        plan_base.update({"current_price": price_for_rules, "action": action})
+        tomorrow_plan = _build_tomorrow_plan(plan_base, position_pct, entry_price, target_price, stop_loss_price)
+        stop_loss_price = tomorrow_plan["stop_loss_price"]
         sanitized.append({
             "code": code,
             "name": base.get("name"),
             "sector": base.get("sector"),
             "action": action,
             "action_label": ACTION_LABELS[action],
-            "entry_price": _round(_num(item.get("entry_price")), 3),
-            "target_price": _round(_num(item.get("target_price")), 3),
-            "stop_loss_price": _round(_num(item.get("stop_loss_price")), 3),
-            "position_pct": _round(_num(item.get("position_pct")), 1),
+            "current_price": current_price,
+            "is_holding": base.get("is_holding"),
+            "cost_price": base.get("cost_price"),
+            "quantity": base.get("quantity"),
+            "entry_price": entry_price,
+            "target_price": target_price,
+            "stop_loss_price": stop_loss_price,
+            "position_pct": position_pct,
+            "moving_averages": tomorrow_plan["moving_averages"],
+            "tomorrow_plan": tomorrow_plan,
             "reason": str(item.get("reason") or "").strip() or "LLM 基于已提供数据补充建议",
         })
         seen.add(code)
@@ -2031,7 +3158,74 @@ def _merge_llm_result(rule_result: dict[str, Any], llm_raw: dict[str, Any]) -> d
 # ========== ETF 关注列表 API ==========
 
 
+async def _import_rotation_pool_items(db: AsyncSession, overwrite_existing: bool = False) -> dict[str, Any]:
+    pool = list(_load_rotation_pool())
+    if not pool:
+        raise ValueError("ETF 轮动观测池配置为空或无法读取")
+
+    codes = [item["code"] for item in pool]
+    existing_rows = (
+        await db.execute(select(EtfWatchItem).where(EtfWatchItem.code.in_(codes)))
+    ).scalars().all()
+    existing = {row.code: row for row in existing_rows}
+    created = updated = revived = unchanged = 0
+    for item in pool:
+        code = item["code"]
+        seed_note = _rotation_pool_note(item)
+        row = existing.get(code)
+        if row:
+            changed = False
+            if row.status != "active":
+                row.status = "active"
+                revived += 1
+                changed = True
+            if overwrite_existing or not row.name:
+                changed = changed or row.name != item.get("name")
+                row.name = item.get("name")
+            if overwrite_existing or not row.sector:
+                changed = changed or row.sector != item.get("group")
+                row.sector = item.get("group")
+            if overwrite_existing or not row.note:
+                changed = changed or row.note != seed_note
+                row.note = seed_note
+            if changed:
+                updated += 1
+            else:
+                unchanged += 1
+            continue
+        db.add(EtfWatchItem(code=code, name=item.get("name"), sector=item.get("group"), note=seed_note, status="active"))
+        created += 1
+    await db.commit()
+    return {
+        "created": created,
+        "updated": updated,
+        "revived": revived,
+        "unchanged": unchanged,
+        "total": len(pool),
+        "codes": codes,
+        "overwrite_existing": overwrite_existing,
+    }
+
+
+@router.get("/watchlist/rotation_pool")
+async def get_etf_rotation_pool():
+    return {
+        "items": list(_load_rotation_pool()),
+        "count": len(_load_rotation_pool()),
+        "source_policy": "基础清单已用 Tushare fund_basic 校验名称；行情和分析数据必须来自真实数据源或本地真实缓存。",
+    }
+
+
+@router.post("/watchlist/import_rotation_pool")
+async def import_etf_rotation_pool(
+    req: EtfRotationPoolImportRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    return await _import_rotation_pool_items(db, overwrite_existing=bool(req.overwrite_existing) if req else False)
+
+
 def _watch_payload(row: EtfWatchItem, quote: dict[str, Any] | None = None) -> dict[str, Any]:
+    meta = _rotation_meta(row.code)
     cost = _num(row.cost_price)
     qty = row.quantity or 0
     cost_amount = (cost * qty) if (cost and qty) else None
@@ -2054,8 +3248,16 @@ def _watch_payload(row: EtfWatchItem, quote: dict[str, Any] | None = None) -> di
     return {
         "id": row.id,
         "code": row.code,
-        "name": row.name or (quote.get("name") if quote else None),
+        "name": row.name or meta.get("name") or (quote.get("name") if quote else None),
+        "alias": meta.get("alias"),
         "sector": row.sector,
+        "pool_group": meta.get("group"),
+        "rotation_direction": meta.get("rotation_direction"),
+        "observation_signal": meta.get("observation_signal"),
+        "sort_order": meta.get("sort_order"),
+        "verified_source": meta.get("verified_source"),
+        "verified_at": meta.get("verified_at"),
+        "is_rotation_pool": bool(meta),
         "is_holding": bool(row.is_holding),
         "cost_price": cost,
         "quantity": qty if qty else None,
@@ -2082,9 +3284,9 @@ async def list_etf_watchlist(db: AsyncSession = Depends(get_db)):
         await db.execute(
             select(EtfWatchItem)
             .where(EtfWatchItem.status == "active")
-            .order_by(desc(EtfWatchItem.is_holding), desc(EtfWatchItem.updated_at))
         )
     ).scalars().all()
+    rows = sorted(rows, key=_watch_sort_key)
     spot = await _fetch_etf_spot_cached(wait_timeout=3.0) if rows else {}
     items = [_watch_payload(r, spot.get(r.code)) for r in rows]
     holdings = [i for i in items if i["is_holding"]]
@@ -2104,6 +3306,7 @@ async def add_etf_watch(req: EtfWatchAddRequest, db: AsyncSession = Depends(get_
     code = _normalize_code(req.code)
     if not code:
         raise HTTPException(status_code=400, detail="ETF代码无效")
+    meta = _rotation_meta(code)
     exists = (
         await db.execute(select(EtfWatchItem).where(EtfWatchItem.code == code))
     ).scalar_one_or_none()
@@ -2133,14 +3336,14 @@ async def add_etf_watch(req: EtfWatchAddRequest, db: AsyncSession = Depends(get_
         return _watch_payload(exists)
     row = EtfWatchItem(
         code=code,
-        name=req.name,
-        sector=req.sector,
+        name=req.name or meta.get("name"),
+        sector=req.sector or meta.get("group"),
         is_holding=bool(req.is_holding),
         cost_price=_dec(req.cost_price),
         quantity=req.quantity,
         target_price=_dec(req.target_price),
         stop_loss_price=_dec(req.stop_loss_price),
-        note=req.note,
+        note=req.note if req.note is not None else _rotation_pool_note(meta),
         status="active",
     )
     db.add(row)
@@ -2184,6 +3387,47 @@ async def remove_etf_watch(item_id: int, db: AsyncSession = Depends(get_db)):
     row.status = "removed"
     await db.commit()
     return {"id": item_id, "status": "removed"}
+
+
+@router.post("/news/manual")
+async def add_manual_etf_news(req: EtfManualNewsRequest, db: AsyncSession = Depends(get_db)):
+    """手动补充经过核验的 ETF 轮动资讯，不从 LLM 推测生成事实。"""
+    publish_time = req.publish_time or datetime.now()
+    related_codes = {
+        "sectors": [s.strip() for s in req.sectors if s.strip()],
+        "keywords": [k.strip() for k in req.keywords if k.strip()],
+    }
+    stmt = pg_insert(NewsEvent).values(
+        title=req.title.strip(),
+        content=(req.content or "").strip() or None,
+        publish_time=publish_time,
+        source=req.source.strip() or "manual_verified",
+        related_codes=related_codes,
+        event_type=req.event_type,
+        sentiment=req.sentiment,
+        updated_at=datetime.now(),
+    ).on_conflict_do_update(
+        index_elements=["title", "publish_time"],
+        set_={
+            "content": (req.content or "").strip() or None,
+            "source": req.source.strip() or "manual_verified",
+            "related_codes": related_codes,
+            "event_type": req.event_type,
+            "sentiment": req.sentiment,
+            "updated_at": datetime.now(),
+        },
+    ).returning(NewsEvent.id)
+    news_id = (await db.execute(stmt)).scalar_one()
+    await db.commit()
+    return {
+        "id": news_id,
+        "title": req.title.strip(),
+        "publish_time": publish_time.isoformat(timespec="seconds"),
+        "source": req.source.strip() or "manual_verified",
+        "related_codes": related_codes,
+        "event_type": req.event_type,
+        "sentiment": req.sentiment,
+    }
 
 
 # ========== ETF 分析核心流程 ==========
@@ -2239,10 +3483,26 @@ async def _analyze_one_etf(
     technicals = _compute_technicals(kline)
     quote = spot.get(code) or {}
     funds = _funds_payload(code, fund_daily, etf_scale)
+    display_name = item.name or quote.get("name")
+    meta = _rotation_meta(code)
+    display_name = display_name or meta.get("name")
+    sector = item.sector or meta.get("group") or _infer_etf_sector(display_name) or "未分类"
+    if item.sector:
+        sector_source = "manual"
+    elif meta.get("group"):
+        sector_source = "rotation_pool"
+    else:
+        sector_source = "inferred_name" if sector != "未分类" else "missing"
     return {
         "code": code,
-        "name": item.name or quote.get("name"),
-        "sector": item.sector or "未分类",
+        "name": display_name,
+        "alias": meta.get("alias"),
+        "sector": sector,
+        "pool_group": meta.get("group"),
+        "rotation_direction": meta.get("rotation_direction"),
+        "observation_signal": meta.get("observation_signal"),
+        "sort_order": meta.get("sort_order"),
+        "sector_source": sector_source,
         "is_holding": bool(item.is_holding),
         "cost_price": _num(item.cost_price),
         "quantity": item.quantity,
@@ -2288,9 +3548,11 @@ def _hot_sectors_from_stats(
         vr = vr_raw if vr_raw is not None else 1.0
         ns = news_scores.get(sector, 50.0)
         news_count = len((sector_news or {}).get(sector, []))
-        # 综合热度：短期表现 60%、量比 20%、资讯情绪 20%
-        heat = 50 + r5 * 2 + (vr - 1) * 20
-        heat = heat * 0.6 + (vr * 30) * 0.2 + ns * 0.2
+        # 综合热度：动量 60%（含加速度 r5-r20）、量比 20%、资讯情绪 20%
+        # 修正：原公式 vr 被双重计入，现拆分为三独立分量
+        momentum_score = max(0.0, min(100.0, 50 + r5 * 4 + (r5 - r20) * 1.5))
+        volume_score = max(0.0, min(100.0, 50 + (vr - 1.0) * 35))
+        heat = momentum_score * 0.60 + volume_score * 0.20 + ns * 0.20
         heat = max(0.0, min(100.0, heat))
         basis = [
             f"覆盖 ETF {s.get('etf_count') or 0} 只",
@@ -2299,7 +3561,7 @@ def _hot_sectors_from_stats(
             f"平均量比 {_volume_basis(vr_raw)}",
             f"近7日匹配资讯 {news_count} 条，新闻情绪分 {_round(ns, 1)}",
         ]
-        hot.append({
+        item = {
             "sector": sector,
             "score": _round(heat, 1),
             "etf_count": s.get("etf_count"),
@@ -2310,9 +3572,33 @@ def _hot_sectors_from_stats(
             "news_count": news_count,
             "basis": basis,
             "reason": "；".join(basis),
-        })
+        }
+        if s.get("code"):
+            item["code"] = s.get("code")
+        if s.get("name"):
+            item["name"] = s.get("name")
+        hot.append(item)
     hot.sort(key=lambda x: x.get("score") or 0, reverse=True)
     return hot
+
+
+def _board_to_heat_score(board: dict[str, Any]) -> float:
+    """把市场板块快照数据换算成 0-100 热度分，用于注入 ETF sector_score。"""
+    r5 = board.get("return_5d")
+    r20 = board.get("return_20d")
+    cp = board.get("change_pct") or 0
+    vr = board.get("volume_ratio") or 1.0
+    inflow_3d = board.get("net_inflow_3d")
+    inflow = board.get("capital_inflow") or 0
+    if r5 is not None:
+        momentum_score = max(0.0, min(100.0, 50 + r5 * 4 + ((r5 - (r20 or 0)) * 1.5)))
+    else:
+        momentum_score = max(0.0, min(100.0, 50 + cp * 6))
+    volume_score = max(0.0, min(100.0, 50 + (vr - 1.0) * 35))
+    # 资金净流入持续性加成（最多 +10 分）
+    inflow_bonus = min(10.0, ((inflow_3d or inflow) / 1e9) * 5) if (inflow_3d or inflow) > 0 else 0.0
+    heat = momentum_score * 0.65 + volume_score * 0.25 + 50 * 0.10 + inflow_bonus
+    return max(0.0, min(100.0, heat))
 
 
 async def _run_etf_analysis_inner(
@@ -2327,19 +3613,19 @@ async def _run_etf_analysis_inner(
         await db.execute(
             select(EtfWatchItem)
             .where(EtfWatchItem.status == "active")
-            .order_by(EtfWatchItem.created_at)
         )
     ).scalars().all()
+    rows = sorted(rows, key=_watch_sort_key)
     if not rows:
         raise ValueError("当前没有 active 的 ETF 关注项，请先添加 ETF")
 
-    _set_task(task_id, progress=10, step=f"加载 {len(rows)} 只 ETF 行情")
-    spot = await _fetch_etf_spot_cached(wait_timeout=20.0)
+    _set_task(task_id, progress=10, step=f"刷新 {len(rows)} 只 ETF 行情")
+    spot = await _fetch_etf_spot_cached(wait_timeout=20.0, force_refresh=True)
 
-    _set_task(task_id, progress=18, step="加载 ETF 净值/折溢价/份额")
+    _set_task(task_id, progress=18, step="刷新 ETF 净值/折溢价/份额")
     fund_daily, scale_result = await asyncio.gather(
-        _fetch_etf_fund_daily_cached(),
-        _fetch_etf_scale_cached(),
+        _fetch_etf_fund_daily_cached(force_refresh=True),
+        _fetch_etf_scale_cached(force_refresh=True),
     )
     etf_scale, scale_gaps = scale_result
 
@@ -2355,6 +3641,8 @@ async def _run_etf_analysis_inner(
     _set_task(task_id, progress=50, step="检测板块轮动信号")
 
     rotation = _detect_sector_rotation(per_etf)
+    # 提取宽基锚定 + 证券ETF市场信号（优先于板块评分计算）
+    market_anchor = _compute_market_anchor_signal(per_etf)
     sectors = list({i["sector"] for i in per_etf if i.get("sector")})
 
     _set_task(task_id, progress=58, step="拉取市场行业/概念板块快照")
@@ -2365,23 +3653,101 @@ async def _run_etf_analysis_inner(
     news_scores: dict[str, float] = {s: _score_sector_sentiment(sector_news.get(s, [])) for s in sectors}
 
     hot_sectors = _hot_sectors_from_stats(rotation["sector_stats"], news_scores, sector_news)
-    sector_score_map = {h["sector"]: h["score"] for h in hot_sectors}
+    sector_score_map: dict[str, float] = {}
+    for h in hot_sectors:
+        score = h.get("score")
+        if score is None:
+            continue
+        for key in (h.get("sector"), h.get("code"), h.get("name")):
+            if key:
+                sector_score_map[str(key)] = score
+    # 从 rotation_direction_stats 补充细粒度方向分数（优先于 group 级别分数）
+    for rd_stat in rotation.get("rotation_direction_stats") or []:
+        rd = rd_stat.get("rotation_direction")
+        if not rd:
+            continue
+        r5 = rd_stat.get("avg_return_5d") or 0
+        vr = rd_stat.get("avg_volume_ratio") or 1.0
+        rd_score = max(0.0, min(100.0, 50 + r5 * 4 + (vr - 1.0) * 20))
+        if rd not in sector_score_map:
+            sector_score_map[rd] = rd_score
+
+    # ── 市场板块快照热度注入（打通热板块 → ETF sector_score 链路）────────
+    # 用 hot_boards + rotation_boards 的外部热度信号覆盖内部循环计算值
+    all_market_boards = (market_boards.get("hot_boards") or []) + (market_boards.get("rotation_boards") or [])
+    for board in all_market_boards:
+        board_score = _board_to_heat_score(board)
+        for etf_item in per_etf:
+            haystack = " ".join(filter(None, [
+                etf_item.get("name"),
+                etf_item.get("sector"),
+                etf_item.get("rotation_direction"),
+                etf_item.get("alias"),
+            ]))
+            relevance, _ = _etf_relevance_for_board(board, haystack, None)
+            if relevance < 58:
+                continue
+            rd = etf_item.get("rotation_direction") or etf_item.get("sector") or ""
+            if rd:
+                sector_score_map[rd] = max(sector_score_map.get(rd, 0.0), board_score)
+
+    risk_mode = market_anchor.get("risk_mode") or "neutral"
 
     _set_task(task_id, progress=75, step="规则化综合评分")
+    rotation_out_keys = _rotation_out_keys(rotation)
     individual: list[dict[str, Any]] = []
     for item in per_etf:
         sector = item.get("sector") or "未分类"
-        sec_score = sector_score_map.get(sector, 50.0)
+        # 优先用 rotation_direction 查分（粒度更细），回退到 group/code/name
+        rotation_direction = item.get("rotation_direction") or ""
+        sec_score = sector_score_map.get(rotation_direction) if rotation_direction else None
+        if sec_score is None:
+            sec_score = sector_score_map.get(str(sector))
+        if sec_score is None:
+            sec_score = sector_score_map.get(str(item.get("code") or ""))
+        if sec_score is None:
+            sec_score = sector_score_map.get(str(item.get("name") or ""))
+        if sec_score is None:
+            sec_score = 50.0
         nws_score = news_scores.get(sector, 50.0)
-        analysis = _rule_analysis_one(item, sec_score, nws_score)
+        analysis = _rule_analysis_one(item, sec_score, nws_score, risk_mode=risk_mode)
         analysis["technicals"] = item["technicals"]
         analysis["is_holding"] = item.get("is_holding")
         analysis["cost_price"] = item.get("cost_price")
+        analysis["quantity"] = item.get("quantity")
         analysis["kline_source"] = item.get("kline_source")
         analysis["funds"] = item.get("funds")
+        analysis["sector_source"] = item.get("sector_source")
+        analysis = _apply_short_term_risk_gate(analysis, rotation_out_keys)
         individual.append(analysis)
 
+    # ── 历史趋势上下文 ───────────────────────────────────────────────────
+    _set_task(task_id, progress=77, step="加载历史分析趋势")
+    hist_ctx = await _build_historical_context(db)
+    hist_per_code = hist_ctx.get("per_code") or {}
+    for item in individual:
+        code = item.get("code")
+        h = hist_per_code.get(code) if code else None
+        if h:
+            item["score_trend"] = h.get("score_trend")
+            item["score_delta"] = h.get("score_delta")
+            item["consecutive_buy_sessions"] = h.get("consecutive_buy_sessions", 0)
+            item["consecutive_hold_sessions"] = h.get("consecutive_hold_sessions", 0)
+            item["score_history"] = h.get("score_history") or []
+            # 连续 ≥3 次 buy/add = 主升浪确认，小幅加分（上限 +5 分）
+            cbs = h.get("consecutive_buy_sessions", 0)
+            if cbs >= 3 and item.get("action") in ("buy", "add", "hold"):
+                boost = min(5.0, (cbs - 2) * 1.5)
+                item["score"] = _round((item.get("score") or 50.0) + boost, 1)
+        else:
+            item["score_trend"] = None
+            item["score_delta"] = None
+            item["consecutive_buy_sessions"] = 0
+            item["consecutive_hold_sessions"] = 0
+            item["score_history"] = []
+
     recommendations = _build_recommendations(individual)
+    recommendations = _enrich_recommendations_with_board_context(recommendations, market_boards)
 
     data_gaps: list[str] = []
     no_kline = [a for a in individual if (a.get("technicals") or {}).get("latest_close") is None]
@@ -2431,7 +3797,11 @@ async def _run_etf_analysis_inner(
             "rotating_in": rotation["rotating_in"],
             "rotating_out": rotation["rotating_out"],
             "early_signals": rotation["early_signals"],
+            "rotation_direction_stats": rotation.get("rotation_direction_stats") or [],
+            "direction_consecutive": hist_ctx.get("direction_consecutive") or {},
+            "direction_heat_trend": hist_ctx.get("direction_heat_trend") or {},
         },
+        "market_anchor": market_anchor,
         "recommendations": recommendations,
         "individual_analysis": individual,
         "has_kline_gaps": has_kline_gaps,
@@ -2470,6 +3840,7 @@ async def _run_etf_analysis_inner(
             if llm.is_available():
                 ctx_for_llm = {
                     "summary_input": rule_result["summary"],
+                    "market_anchor": market_anchor,
                     "hot_sectors": hot_sectors[:8],
                     "rotation_signals": rule_result["rotation_signals"],
                     "individual_analysis": [
@@ -2479,6 +3850,11 @@ async def _run_etf_analysis_inner(
                     "market_overview": {
                         "etf_count": len(per_etf),
                         "sector_count": len(sectors),
+                    },
+                    "historical_context": {
+                        "direction_consecutive": hist_ctx.get("direction_consecutive") or {},
+                        "direction_heat_trend": hist_ctx.get("direction_heat_trend") or {},
+                        "note": "direction_consecutive=N 表示该轮动方向已连续 N 次进入 rotating_in；≥3 视为主升浪方向，可在 rotation_forecast 中标注 high confidence",
                     },
                 }
                 raw = await llm.chat_json(
@@ -2533,6 +3909,7 @@ async def _run_etf_analysis_inner(
     overview["market_boards_fetched_at"] = market_boards.get("fetched_at")
     overview["risk_warnings"] = final_result.get("risk_warnings") or []
     overview["has_kline_gaps"] = bool(final_result.get("has_kline_gaps"))
+    overview["market_anchor"] = final_result.get("market_anchor") or {}
     final_result["market_overview"] = overview
 
     _set_task(task_id, progress=95, step="保存分析记录")
@@ -2576,6 +3953,7 @@ def _record_payload(row: EtfAnalysisRecord) -> dict[str, Any]:
         "llm_recommendations": (row.recommendations or {}).get("llm") if isinstance(row.recommendations, dict) else [],
         "individual_analysis": (row.individual_analysis or {}).get("items") if isinstance(row.individual_analysis, dict) else (row.individual_analysis or []),
         "market_overview": overview,
+        "market_anchor": overview.get("market_anchor") or {},
         "market_hot_boards": overview.get("market_hot_boards") or [],
         "market_rotation_boards": overview.get("market_rotation_boards") or [],
         "market_early_signals": overview.get("market_early_signals") or [],
@@ -2729,6 +4107,75 @@ async def get_etf_analysis_record(record_id: int, db: AsyncSession = Depends(get
     if not row:
         raise HTTPException(status_code=404, detail="分析记录不存在")
     return _record_payload(row)
+
+
+@router.get("/detail/{code}")
+async def get_etf_detail(
+    code: str,
+    lookback_days: int = Query(default=120, ge=30, le=365),
+    db: AsyncSession = Depends(get_db),
+):
+    clean = _normalize_code(code)
+    if not clean:
+        raise HTTPException(status_code=400, detail="ETF代码无效")
+    row = (
+        await db.execute(select(EtfWatchItem).where(EtfWatchItem.code == clean, EtfWatchItem.status == "active"))
+    ).scalar_one_or_none()
+    spot = await _fetch_etf_spot_cached(wait_timeout=5.0)
+    fund_daily, scale_result = await asyncio.gather(_fetch_etf_fund_daily_cached(), _fetch_etf_scale_cached())
+    etf_scale, scale_gaps = scale_result
+    kline, kline_source = await _load_etf_kline(db, clean, lookback_days)
+    quote = spot.get(clean) or {}
+    funds = _funds_payload(clean, fund_daily, etf_scale)
+    technicals = _compute_technicals(kline)
+    latest_record = (
+        await db.execute(
+            select(EtfAnalysisRecord).order_by(desc(EtfAnalysisRecord.analysis_time), desc(EtfAnalysisRecord.id)).limit(1)
+        )
+    ).scalar_one_or_none()
+    latest_analysis = None
+    latest_record_meta = None
+    if latest_record:
+        latest_payload = _record_payload(latest_record)
+        latest_record_meta = {k: latest_payload.get(k) for k in ("id", "analysis_time", "summary", "llm_used")}
+        for item in latest_payload.get("individual_analysis") or []:
+            if _normalize_code(item.get("code")) == clean:
+                latest_analysis = item
+                break
+    meta = _rotation_meta(clean)
+    watch_item = _watch_payload(row, quote) if row else {
+        "code": clean,
+        "name": meta.get("name") or quote.get("name"),
+        "alias": meta.get("alias"),
+        "sector": meta.get("group"),
+        "rotation_direction": meta.get("rotation_direction"),
+        "observation_signal": meta.get("observation_signal"),
+        "note": _rotation_pool_note(meta),
+        "current_price": quote.get("price"),
+        "change_pct": quote.get("change_pct"),
+    }
+    data_gaps = list(scale_gaps)
+    if not kline:
+        data_gaps.append("该 ETF 缺少 K 线数据，无法绘制价格图和计算技术指标")
+    if not quote:
+        data_gaps.append("该 ETF 实时行情快照暂不可用")
+    if not funds.get("source"):
+        data_gaps.append("该 ETF 净值/份额资金面数据暂不可用")
+    if latest_analysis is None:
+        data_gaps.append("最新分析记录中尚无该 ETF 的逐项分析，请先运行一次 ETF 分析")
+    return {
+        "code": clean,
+        "watch_item": watch_item,
+        "quote": quote,
+        "funds": funds,
+        "kline": kline,
+        "kline_source": kline_source,
+        "technicals": technicals,
+        "latest_analysis": latest_analysis,
+        "latest_record": latest_record_meta,
+        "data_gaps": data_gaps,
+        "source_policy": SOURCE_POLICY,
+    }
 
 
 # ========== K 线补全 API ==========
