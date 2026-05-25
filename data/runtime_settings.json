@@ -2,5 +2,6 @@
   "custom_api_key": "sk-wsvgnkviticgjqbrtkokfeirmcvoruigvnqodhubmyncleex",
   "custom_base_url": "https://api.siliconflow.cn/v1",
   "custom_model": "Pro/zai-org/GLM-5.1",
-  "tushare_token": "825df592f72fd067995ca8828b6b5da82acec525817fac2083555dfd"
+  "tushare_token": "825df592f72fd067995ca8828b6b5da82acec525817fac2083555dfd",
+  "feishu_webhook_url": "https://open.larkoffice.com/open-apis/bot/v2/hook/2326266f-9f17-470f-8db8-5cf572b572d6"
 }

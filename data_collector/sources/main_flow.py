@@ -10,6 +10,7 @@ from datetime import date, timedelta
 import akshare as ak
 import pandas as pd
 
+from common.config import get_settings
 from common.logger import get_logger
 from data_collector.cache.redis_cache import RedisCache
 from data_collector.storage import DataStorage
@@ -23,6 +24,89 @@ class MainFlowCollector:
     def __init__(self, storage: DataStorage, cache: RedisCache):
         self.storage = storage
         self.cache = cache
+
+    async def collect_tushare_moneyflow(self, trade_date: date) -> int:
+        """使用 Tushare moneyflow 按交易日补全全市场个股资金流。
+
+        Tushare 金额字段单位为万元；本系统 stock_main_flows 使用元。
+        主力口径 = 大单 + 超大单，散户口径 = 小单 + 中单。
+        """
+        token = get_settings().data_source.tushare_token
+        if not token:
+            logger.warning("Tushare token 未配置，跳过全市场主力资金补采")
+            return 0
+        try:
+            import tushare as ts
+        except ImportError:
+            logger.warning("tushare 未安装，跳过全市场主力资金补采")
+            return 0
+
+        trade_date_str = trade_date.strftime("%Y%m%d")
+
+        def _fetch():
+            ts.set_token(token)
+            pro = ts.pro_api(token)
+            return pro.moneyflow(trade_date=trade_date_str)
+
+        try:
+            df = await asyncio.to_thread(_fetch)
+        except Exception as e:
+            logger.warning(f"Tushare 全市场主力资金补采失败: trade_date={trade_date_str}, error={e}")
+            return 0
+
+        if df is None or df.empty:
+            logger.warning(f"Tushare 全市场主力资金为空: trade_date={trade_date_str}")
+            return 0
+
+        records: list[dict] = []
+        for _, row in df.iterrows():
+            code = self._ts_code_to_code(row.get("ts_code"))
+            if not code:
+                continue
+
+            buy_lg = self._to_yuan(row.get("buy_lg_amount"))
+            buy_elg = self._to_yuan(row.get("buy_elg_amount"))
+            sell_lg = self._to_yuan(row.get("sell_lg_amount"))
+            sell_elg = self._to_yuan(row.get("sell_elg_amount"))
+            buy_sm = self._to_yuan(row.get("buy_sm_amount"))
+            buy_md = self._to_yuan(row.get("buy_md_amount"))
+            sell_sm = self._to_yuan(row.get("sell_sm_amount"))
+            sell_md = self._to_yuan(row.get("sell_md_amount"))
+
+            main_buy = self._sum_present(buy_lg, buy_elg)
+            main_sell = self._sum_present(sell_lg, sell_elg)
+            retail_buy = self._sum_present(buy_sm, buy_md)
+            retail_sell = self._sum_present(sell_sm, sell_md)
+            main_net = (
+                main_buy - main_sell
+                if main_buy is not None and main_sell is not None
+                else self._to_yuan(row.get("net_mf_amount"))
+            )
+            retail_net = (
+                retail_buy - retail_sell
+                if retail_buy is not None and retail_sell is not None
+                else None
+            )
+
+            if main_net is None and main_buy is None:
+                continue
+
+            records.append(
+                {
+                    "code": code,
+                    "trade_date": trade_date,
+                    "main_net": main_net,
+                    "main_buy": main_buy,
+                    "main_sell": main_sell,
+                    "retail_net": retail_net,
+                    "main_net_pct": None,
+                    "source": "tushare_moneyflow",
+                }
+            )
+
+        await self.storage.upsert_stock_main_flows(records)
+        logger.info(f"Tushare 全市场主力资金补采完成: trade_date={trade_date_str}, records={len(records)}")
+        return len(records)
 
     async def collect_single(self, code: str, days: int = 5) -> int:
         """采集单只股票的主力资金流
@@ -157,6 +241,29 @@ class MainFlowCollector:
         if code.startswith(("4", "8")):
             return "bj"
         return "sz"
+
+    @staticmethod
+    def _ts_code_to_code(value) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        return text.split(".", 1)[0].zfill(6)
+
+    @staticmethod
+    def _sum_present(*values: float | None) -> float | None:
+        present = [v for v in values if v is not None]
+        return sum(present) if present else None
+
+    @staticmethod
+    def _to_yuan(value) -> float | None:
+        """Tushare moneyflow amount: 万元 -> 元。"""
+        if value is None:
+            return None
+        try:
+            v = float(value)
+            return None if pd.isna(v) else v * 10000
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _parse_amount(row, candidates: list[str]) -> float | None:

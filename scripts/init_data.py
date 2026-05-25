@@ -141,7 +141,7 @@ async def main():
     logger.info("全部完成！数据汇总:")
     for k, v in results.items():
         logger.info(f"  {k}: {v}")
-    logger.info("现在可以访问 http://localhost:3000 查看 Dashboard")
+    logger.info("现在可以访问 http://localhost:3010 查看 Dashboard")
 
 
 if __name__ == "__main__":

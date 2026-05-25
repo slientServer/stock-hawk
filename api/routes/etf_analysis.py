@@ -16,11 +16,12 @@ from typing import Any
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agents.llm_client import LLMClient
+from agents.tools.notification_tools import NotificationTools
 from api.deps import get_db, get_session_factory
 from common.config import get_settings
 from common.logger import get_logger
@@ -371,6 +372,10 @@ def _normalize_kline_rows(rows: list[dict[str, Any]], source: str) -> list[dict[
         volume = _num(row.get("volume"))
         if trade_date is None or None in (open_price, close_price, high_price, low_price):
             continue
+        amount = _num(row.get("amount"))
+        if amount is None and volume is not None and close_price is not None:
+            # 多数 ETF K 线源的成交量为“手”，成交额缺失时用收盘价近似派生。
+            amount = close_price * volume * 100
         normalized.append({
             "trade_date": trade_date,
             "open": open_price,
@@ -378,7 +383,7 @@ def _normalize_kline_rows(rows: list[dict[str, Any]], source: str) -> list[dict[
             "high": high_price,
             "low": low_price,
             "volume": int(volume) if volume is not None else None,
-            "amount": _num(row.get("amount")),
+            "amount": amount,
             "change_pct": _num(row.get("change_pct")),
             "turnover_rate": _num(row.get("turnover_rate")),
             "source": source,
@@ -617,7 +622,7 @@ async def _upsert_etf_kline_cache(db: AsyncSession, code: str, rows: list[dict[s
         "high": stmt.excluded.high,
         "low": stmt.excluded.low,
         "volume": stmt.excluded.volume,
-        "amount": stmt.excluded.amount,
+        "amount": func.coalesce(stmt.excluded.amount, EtfDailyKline.amount),
         "change_pct": stmt.excluded.change_pct,
         "turnover_rate": stmt.excluded.turnover_rate,
         "source": stmt.excluded.source,
@@ -3991,9 +3996,49 @@ async def _run_etf_analysis_task(task_id: str, params: dict[str, Any], session_f
                     result=payload,
                     record_id=payload.get("id"),
                 )
+                try:
+                    msg = _build_etf_feishu_message(payload)
+                    await NotificationTools().send_feishu(msg)
+                except Exception as notify_err:
+                    logger.warning(f"ETF 飞书推送失败（不影响主流程）: {notify_err}")
     except Exception as e:
         logger.error(f"ETF analysis task {task_id} failed: {e}")
         _set_task(task_id, status="failed", progress=100, step="分析失败", error_message=str(e))
+
+
+def _build_etf_feishu_message(payload: dict[str, Any]) -> str:
+    """格式化 ETF 分析结果为飞书推送文本。"""
+    analysis_time = payload.get("analysis_time") or ""
+    lines = [f"CtxHub 【ETF 轮动分析 {analysis_time[:10]}】"]
+
+    summary = payload.get("summary") or ""
+    if summary:
+        lines.append(summary[:200])
+
+    recs = payload.get("recommendations") or []
+    if recs:
+        lines.append(f"\n📋 配置建议（共{len(recs)}只）")
+        for item in recs[:5]:
+            action_label = item.get("action_label") or item.get("action") or ""
+            score = item.get("score") or 0
+            price = item.get("current_price") or 0
+            tp = item.get("target_price") or 0
+            sl = item.get("stop_loss_price") or 0
+            reason = (item.get("reason") or "")[:60]
+            lines.append(
+                f"• [{action_label}] {item.get('name', '')}({item.get('code', '')}) 评分{score}\n"
+                f"  现价:{price} | 目标:{tp} | 止损:{sl}\n"
+                f"  {reason}"
+            )
+
+    hot = payload.get("hot_sectors") or []
+    if hot:
+        hot_names = "、".join(s.get("sector_name", "") for s in hot[:4])
+        lines.append(f"\n🔥 热门板块: {hot_names}")
+
+    llm_used = payload.get("llm_used", False)
+    lines.append(f"\n{'✅ LLM 已增强' if llm_used else '⚠️ 规则模式（未使用 LLM）'}")
+    return "\n".join(lines)
 
 
 async def run_scheduled_etf_analysis(session_factory) -> dict[str, Any]:
@@ -4021,6 +4066,11 @@ async def run_scheduled_etf_analysis(session_factory) -> dict[str, Any]:
                     result=payload,
                     record_id=payload.get("id"),
                 )
+                try:
+                    msg = _build_etf_feishu_message(payload)
+                    await NotificationTools().send_feishu(msg)
+                except Exception as notify_err:
+                    logger.warning(f"ETF 飞书推送失败（不影响主流程）: {notify_err}")
                 return payload
     except Exception as e:
         logger.error(f"Scheduled ETF analysis failed: {e}")

@@ -1,71 +1,33 @@
-"""Agent 调度器：APScheduler 定时任务管理"""
+"""Agent 调度器：ETF 分析、财经资讯、盘前选股、日K线与主力资金定时任务。"""
 
-import asyncio
-from datetime import date
 from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from agents.automation import AutomationRunner
-from agents.orchestrator import Orchestrator
 from common.logger import get_logger
 
 logger = get_logger(__name__)
 
 
 class AgentScheduler:
-    """定时任务管理：每日扫描、每周分析、手动触发"""
+    """当前产品定时任务管理。"""
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession], automation_runner: AutomationRunner | None = None):
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession], automation_runner: Any | None = None):
         self._session_factory = session_factory
-        self._orchestrator = Orchestrator(session_factory)
-        self._automation = automation_runner or AutomationRunner(session_factory)
         self._scheduler = AsyncIOScheduler()
         self._setup_jobs()
 
-    def _setup_jobs(self):
-        # 每日扫描：周一至周五 18:00
+    def _setup_jobs(self) -> None:
         self._scheduler.add_job(
-            self._run_daily,
-            "cron",
-            day_of_week="mon-fri",
-            hour=18,
-            minute=0,
-            id="daily_scan",
-            name="交易日收盘自动流程",
+            self._run_finance_news,
+            "interval",
+            hours=1,
+            id="finance_news_hourly",
+            name="财经资讯每小时拉取与今日小结",
+            max_instances=1,
+            coalesce=True,
         )
-        # 尾盘选股：周一至周五 14:50（盘中实时快照）
-        self._scheduler.add_job(
-            self._run_eod_screener,
-            "cron",
-            day_of_week="mon-fri",
-            hour=14,
-            minute=50,
-            id="eod_screener",
-            name="尾盘盘中自动选股",
-        )
-        # 每周分析：周六 10:00
-        self._scheduler.add_job(
-            self._run_weekly,
-            "cron",
-            day_of_week="sat",
-            hour=10,
-            minute=0,
-            id="weekly_analysis",
-            name="每周产业链分析",
-        )
-        # 产业链发现：周日 8:00
-        self._scheduler.add_job(
-            self._run_chain_discovery,
-            "cron",
-            day_of_week="sun",
-            hour=8,
-            minute=0,
-            id="chain_discovery",
-            name="周末产业链发现与周报",
-        )
-        # ETF 板块轮动分析：周一至周五 18:30
         self._scheduler.add_job(
             self._run_etf_analysis,
             "cron",
@@ -73,110 +35,110 @@ class AgentScheduler:
             hour=18,
             minute=30,
             id="etf_analysis",
-            name="ETF板块轮动定时分析",
+            name="每日盘后 ETF 大模型轮动分析",
+            max_instances=1,
+            coalesce=True,
+        )
+        self._scheduler.add_job(
+            self._run_pre_market_screen,
+            "cron",
+            day_of_week="mon-fri",
+            hour=7,
+            minute=0,
+            id="pre_market_screen",
+            name="每日盘前 7AM 短线选股",
+            max_instances=1,
+            coalesce=True,
+        )
+        self._scheduler.add_job(
+            self._run_pre_market_perf_update,
+            "cron",
+            day_of_week="mon-fri",
+            hour=16,
+            minute=30,
+            id="pre_market_perf",
+            name="盘后绩效回填",
+            max_instances=1,
+            coalesce=True,
+        )
+        self._scheduler.add_job(
+            self._run_daily_kline_update,
+            "cron",
+            day_of_week="mon-fri",
+            hour=15,
+            minute=30,
+            id="daily_kline_update",
+            name="每日收盘后全市场日K线更新",
+            max_instances=1,
+            coalesce=True,
+        )
+        self._scheduler.add_job(
+            self._run_main_flow_update,
+            "cron",
+            day_of_week="mon-fri",
+            hour=15,
+            minute=45,
+            id="main_flow_update",
+            name="每日收盘后主力资金流更新",
+            max_instances=1,
+            coalesce=True,
+        )
+        self._scheduler.add_job(
+            self._run_portfolio_monitor,
+            "cron",
+            day_of_week="mon-fri",
+            hour="9-14",
+            minute="*/5",
+            id="portfolio_monitor",
+            name="盘中每5分钟持仓+关注列表盯盘推送",
+            max_instances=1,
+            coalesce=True,
         )
 
-    def start(self):
+    def start(self) -> None:
         self._scheduler.start()
         jobs = self._scheduler.get_jobs()
-        logger.info(f"AgentScheduler started with {len(jobs)} jobs")
+        logger.info("AgentScheduler started with %s jobs", len(jobs))
         for job in jobs:
-            logger.info(f"  Job: {job.id} - {job.name} - next: {job.next_run_time}")
+            logger.info("  Job: %s - %s - next: %s", job.id, job.name, job.next_run_time)
 
-    def stop(self):
+    def stop(self) -> None:
         self._scheduler.shutdown(wait=False)
         logger.info("AgentScheduler stopped")
 
     def get_jobs(self) -> list[dict[str, Any]]:
         return [
             {
-                "id": j.id,
-                "name": j.name,
-                "next_run": str(j.next_run_time),
-                "trigger": str(j.trigger),
+                "id": job.id,
+                "name": job.name,
+                "next_run": str(job.next_run_time),
+                "trigger": str(job.trigger),
             }
-            for j in self._scheduler.get_jobs()
+            for job in self._scheduler.get_jobs()
         ]
 
     async def trigger_manual(self, workflow_type: str, **kwargs) -> dict[str, Any]:
-        """手动触发工作流"""
-        if workflow_type in {"daily", "daily_after_close"}:
-            return await self._automation.run("daily_after_close", trigger="manual", params=kwargs)
-        elif workflow_type == "weekly":
-            return await self._automation.run("weekly_discovery", trigger="manual", params=kwargs)
-        elif workflow_type == "deep_research":
-            chain_id = kwargs.get("chain_id", "")
-            if not chain_id:
-                return {"error": "chain_id required for deep_research"}
-            return await self._orchestrator.run_deep_research(chain_id)
-        elif workflow_type == "risk_check":
-            return await self._automation.run("risk_check", trigger="manual", params=kwargs)
-        elif workflow_type == "chain_discovery":
-            return await self._automation.run("chain_discovery", trigger="manual", params=kwargs)
-        elif workflow_type in {"daily_scan", "weekly_analysis", "weekly_discovery"}:
-            return await self._automation.run(workflow_type, trigger="manual", params=kwargs)
-        elif workflow_type == "eod_screener":
-            return await self._run_eod_screener_manual(**kwargs)
-        elif workflow_type == "etf_analysis":
+        if workflow_type == "etf_analysis":
             return await self._run_etf_analysis_manual()
-        else:
-            return {"error": f"Unknown workflow_type: {workflow_type}"}
+        if workflow_type in {"finance_news", "finance_news_hourly", "news_center"}:
+            return await self._run_finance_news_manual(**kwargs)
+        if workflow_type == "pre_market":
+            return await self._run_pre_market_screen_manual(**kwargs)
+        if workflow_type == "pre_market_perf":
+            return await self._run_pre_market_perf_manual()
+        if workflow_type == "daily_kline":
+            return await self._run_daily_kline_update_manual()
+        if workflow_type == "main_flow":
+            return await self._run_main_flow_update_manual()
+        return {"error": f"Unknown workflow_type: {workflow_type}"}
 
-    async def _run_daily(self):
-        logger.info("Cron trigger: daily_scan")
-        try:
-            await self._automation.run("daily_after_close", trigger="cron")
-        except Exception as e:
-            logger.error(f"Daily scan cron failed: {e}")
-
-    async def _run_weekly(self):
-        logger.info("Cron trigger: weekly_analysis")
-        try:
-            await self._automation.run("weekly_analysis", trigger="cron")
-        except Exception as e:
-            logger.error(f"Weekly analysis cron failed: {e}")
-
-    async def _run_chain_discovery(self):
-        logger.info("Cron trigger: chain_discovery")
-        try:
-            await self._automation.run("weekly_discovery", trigger="cron")
-        except Exception as e:
-            logger.error(f"Chain discovery cron failed: {e}")
-
-    async def _run_eod_screener(self):
-        logger.info("Cron trigger: eod_screener")
-        try:
-            result = await self._collect_and_run_eod_screener(date.today())
-            logger.info(
-                "尾盘选股完成: status=%s, trade_date=%s, count=%s",
-                result.get("status"),
-                result.get("trade_date"),
-                result.get("count"),
-            )
-        except Exception as e:
-            logger.error(f"EOD screener cron failed: {e}")
-
-    async def _run_eod_screener_manual(self, **kwargs) -> dict[str, Any]:
-        try:
-            trade_date = self._parse_trade_date(kwargs.get("trade_date"))
-            return await self._collect_and_run_eod_screener(trade_date)
-        except Exception as e:
-            logger.error(f"EOD screener manual failed: {e}")
-            return {"status": "failed", "error": str(e)}
-
-    async def _run_etf_analysis(self):
+    async def _run_etf_analysis(self) -> None:
         logger.info("Cron trigger: etf_analysis")
         try:
-            from api.routes.etf_analysis import run_scheduled_etf_analysis
-
-            result = await run_scheduled_etf_analysis(self._session_factory)
-            logger.info(
-                "ETF板块轮动分析完成: task=%s, etf_count=%s",
-                result.get("task_id"),
-                result.get("etf_count"),
-            )
+            result = await self._run_etf_analysis_manual()
+            logger.info("ETF 分析完成: %s", result.get("task_id") or result.get("status"))
         except Exception as e:
-            logger.error(f"ETF analysis cron failed: {e}")
+            logger.error("ETF analysis cron failed: %s", e)
 
     async def _run_etf_analysis_manual(self) -> dict[str, Any]:
         try:
@@ -184,48 +146,136 @@ class AgentScheduler:
 
             return await run_scheduled_etf_analysis(self._session_factory)
         except Exception as e:
-            logger.error(f"ETF analysis manual failed: {e}")
+            logger.error("ETF analysis manual failed: %s", e)
             return {"status": "failed", "error": str(e)}
 
-    async def _collect_and_run_eod_screener(self, trade_date: date | None = None) -> dict[str, Any]:
-        from data_collector.cache.redis_cache import RedisCache
-        from data_collector.sources.market_kline import KlineCollector
-        from data_collector.storage import DataStorage
-        from eod_screener.screener import EODScreener
-
-        storage = DataStorage(self._session_factory)
-        collector = KlineCollector(storage, RedisCache())
-        collect_result = await collector.collect_full_market_daily(trade_date, lookback_days=30, mode="intraday")
-        if collect_result.get("status") == "failed":
-            return {
-                "status": "blocked",
-                "trade_date": collect_result.get("trade_date") or (str(trade_date) if trade_date else None),
-                "count": 0,
-                "collect_result": collect_result,
-                "screen_result": None,
-            }
-
-        screener = EODScreener(self._session_factory)
-        run_trade_date = self._parse_trade_date(collect_result.get("trade_date")) or trade_date
-        screen_result = await screener.run_with_diagnostics(
-            run_trade_date,
-            data_mode=str(collect_result.get("data_mode") or "intraday"),
-            quote_source=collect_result.get("source"),
-            quote_time=collect_result.get("quote_time"),
-        )
-        return {
-            "status": screen_result.get("status"),
-            "trade_date": screen_result.get("trade_date"),
-            "count": screen_result.get("count", 0),
-            "collect_result": collect_result,
-            "screen_result": screen_result,
-        }
-
-    @staticmethod
-    def _parse_trade_date(value: Any) -> date | None:
-        if value is None or isinstance(value, date):
-            return value
+    async def _run_finance_news(self) -> None:
+        logger.info("Cron trigger: finance_news_hourly")
         try:
-            return date.fromisoformat(str(value))
-        except ValueError:
-            return None
+            result = await self._run_finance_news_manual()
+            logger.info(
+                "财经资讯刷新完成: fetched=%s inserted=%s",
+                result.get("fetched_count"),
+                result.get("inserted_count"),
+            )
+        except Exception as e:
+            logger.error("Finance news cron failed: %s", e)
+
+    async def _run_finance_news_manual(self, **kwargs) -> dict[str, Any]:
+        try:
+            from api.routes.news_center import run_scheduled_finance_news
+
+            return await run_scheduled_finance_news(self._session_factory)
+        except Exception as e:
+            logger.error("Finance news manual failed: %s", e)
+            return {"status": "failed", "error": str(e)}
+
+    async def _run_pre_market_screen(self) -> None:
+        logger.info("Cron trigger: pre_market_screen")
+        try:
+            result = await self._run_pre_market_screen_manual()
+            logger.info(
+                "盘前选股完成: aggressive=%s stable=%s",
+                result.get("aggressive_count"),
+                result.get("stable_count"),
+            )
+        except Exception as e:
+            logger.error("Pre-market screen cron failed: %s", e)
+
+    async def _run_pre_market_screen_manual(self, **kwargs) -> dict[str, Any]:
+        try:
+            from api.routes.pre_market import run_scheduled_pre_market_screen
+
+            return await run_scheduled_pre_market_screen(self._session_factory)
+        except Exception as e:
+            logger.error("Pre-market screen manual failed: %s", e)
+            return {"status": "failed", "error": str(e)}
+
+    async def _run_pre_market_perf_update(self) -> None:
+        logger.info("Cron trigger: pre_market_perf")
+        try:
+            result = await self._run_pre_market_perf_manual()
+            logger.info("绩效回填完成: updated=%s", result.get("updated"))
+        except Exception as e:
+            logger.error("Pre-market perf cron failed: %s", e)
+
+    async def _run_pre_market_perf_manual(self) -> dict[str, Any]:
+        try:
+            from api.routes.pre_market import run_scheduled_perf_update
+
+            return await run_scheduled_perf_update(self._session_factory)
+        except Exception as e:
+            logger.error("Pre-market perf manual failed: %s", e)
+            return {"status": "failed", "error": str(e)}
+
+    # ── 日K线更新 ──────────────────────────────────────────────────────────────
+
+    async def _run_daily_kline_update(self) -> None:
+        logger.info("Cron trigger: daily_kline_update")
+        try:
+            result = await self._run_daily_kline_update_manual()
+            logger.info(
+                "全市场日K线更新完成: status=%s records=%s",
+                result.get("status"),
+                result.get("records_count"),
+            )
+        except Exception as e:
+            logger.error("Daily kline update cron failed: %s", e)
+
+    async def _run_daily_kline_update_manual(self) -> dict[str, Any]:
+        try:
+            from data_collector.sources.market_kline import KlineCollector
+            from data_collector.storage import DataStorage
+            from data_collector.cache.redis_cache import RedisCache
+
+            storage = DataStorage(self._session_factory)
+            cache = RedisCache()
+            collector = KlineCollector(storage, cache)
+            return await collector.collect_full_market_daily(lookback_days=5)
+        except Exception as e:
+            logger.error("Daily kline update manual failed: %s", e)
+            return {"status": "failed", "error": str(e)}
+
+    # ── 主力资金流更新 ──────────────────────────────────────────────────────────
+
+    async def _run_main_flow_update(self) -> None:
+        logger.info("Cron trigger: main_flow_update")
+        try:
+            result = await self._run_main_flow_update_manual()
+            logger.info("主力资金流更新完成: records=%s", result.get("records"))
+        except Exception as e:
+            logger.error("Main flow update cron failed: %s", e)
+
+    async def _run_main_flow_update_manual(self) -> dict[str, Any]:
+        try:
+            from datetime import date
+            from data_collector.sources.main_flow import MainFlowCollector
+            from data_collector.storage import DataStorage
+            from data_collector.cache.redis_cache import RedisCache
+
+            storage = DataStorage(self._session_factory)
+            cache = RedisCache()
+            collector = MainFlowCollector(storage, cache)
+            records = await collector.collect_tushare_moneyflow(date.today())
+            return {"status": "completed", "records": records}
+        except Exception as e:
+            logger.error("Main flow update manual failed: %s", e)
+            return {"status": "failed", "error": str(e)}
+
+    # ── 盯盘监控 ───────────────────────────────────────────────────────────────
+
+    async def _run_portfolio_monitor(self) -> None:
+        try:
+            from api.routes.portfolio import check_and_notify_positions
+            from api.routes.watchlist import check_and_notify_watchlist
+
+            r1 = await check_and_notify_positions(self._session_factory)
+            r2 = await check_and_notify_watchlist(self._session_factory)
+            total = (r1.get("notified") or 0) + (r2.get("notified") or 0)
+            if total > 0:
+                logger.info(
+                    "盯盘推送: portfolio=%s watchlist=%s",
+                    r1.get("notified"), r2.get("notified"),
+                )
+        except Exception as e:
+            logger.error("Portfolio/watchlist monitor failed: %s", e)

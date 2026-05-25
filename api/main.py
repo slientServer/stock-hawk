@@ -1,23 +1,40 @@
+import os
 from contextlib import asynccontextmanager
 
 import redis.asyncio as aioredis
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from neo4j import AsyncGraphDatabase
 
-from agents.automation import AutomationRunner
 from agents.scheduler import AgentScheduler
 from api.deps import get_session_factory
 from api.routes import all_routers
 from common.config import get_settings
 
 
+def get_cors_origins() -> list[str]:
+    origins = {
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3010",
+        "http://127.0.0.1:3010",
+    }
+    web_port = os.environ.get("WEB_PORT")
+    if web_port:
+        origins.add(f"http://localhost:{web_port}")
+        origins.add(f"http://127.0.0.1:{web_port}")
+
+    for origin in os.environ.get("CORS_ORIGINS", "").split(","):
+        origin = origin.strip()
+        if origin:
+            origins.add(origin)
+
+    return sorted(origins)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     session_factory = get_session_factory()
-    automation_runner = AutomationRunner(session_factory)
-    agent_scheduler = AgentScheduler(session_factory, automation_runner)
-    app.state.automation_runner = automation_runner
+    agent_scheduler = AgentScheduler(session_factory)
     app.state.agent_scheduler = agent_scheduler
     agent_scheduler.start()
     try:
@@ -35,12 +52,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:3010",
-        "http://127.0.0.1:3010",
-    ],
+    allow_origins=get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -50,7 +62,7 @@ app.add_middleware(
 @app.get("/health")
 async def health_check():
     settings = get_settings()
-    status = {"api": "ok", "postgres": "unknown", "neo4j": "unknown", "redis": "unknown"}
+    status = {"api": "ok", "postgres": "unknown", "redis": "unknown"}
 
     # Check PostgreSQL
     try:
@@ -68,19 +80,6 @@ async def health_check():
         status["postgres"] = "ok"
     except Exception as e:
         status["postgres"] = f"error: {str(e)}"
-
-    # Check Neo4j
-    try:
-        driver = AsyncGraphDatabase.driver(
-            settings.neo4j.uri,
-            auth=(settings.neo4j.user, settings.neo4j.password),
-        )
-        async with driver.session() as session:
-            await session.run("RETURN 1")
-        await driver.close()
-        status["neo4j"] = "ok"
-    except Exception as e:
-        status["neo4j"] = f"error: {str(e)}"
 
     # Check Redis
     try:

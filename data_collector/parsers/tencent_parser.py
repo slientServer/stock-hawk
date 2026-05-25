@@ -18,13 +18,15 @@ class TencentParser:
 
         内部代码 "600519" -> "sh600519"
         内部代码 "000001" -> "sz000001"
+        上海市场: 6xxxxx(A股) / 5xxxxx(ETF/基金) / 11xxxx(可转债)
+        深圳市场: 0xxxxx(主板) / 3xxxxx(创业板) / 1xxxxx(ETF/基金/可转债)
         """
         result = []
         for code in codes:
             code = code.strip()
             if code.startswith(("sh", "sz")):
                 result.append(code)
-            elif code.startswith("6"):
+            elif code.startswith(("6", "5")):
                 result.append(f"sh{code}")
             else:
                 result.append(f"sz{code}")

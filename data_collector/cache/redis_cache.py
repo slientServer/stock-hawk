@@ -43,9 +43,12 @@ class RedisCache:
                 pipe.set(key, json.dumps(data, ensure_ascii=False), ex=3)
             await pipe.execute()
 
+    # 增量标记保留 90 天（7776000 秒），防止历史标记无限堆积
+    _INCR_MARKER_TTL = 7776000
+
     async def set_incremental_marker(self, source: str, date: str):
         key = f"incr_marker:{source}:{date}"
-        await self.redis.set(key, "1")
+        await self.redis.set(key, "1", ex=self._INCR_MARKER_TTL)
 
     async def is_collected(self, source: str, date: str) -> bool:
         key = f"incr_marker:{source}:{date}"

@@ -4,10 +4,29 @@ set -e
 cd "$(dirname "$0")/.."
 PROJECT_ROOT=$(pwd)
 
-echo "=== Stock Hawk 启动 ==="
+# 解析参数：--api-only 只重启后端，跳过 Docker/迁移/前端
+API_ONLY=false
+for arg in "$@"; do
+  case "$arg" in
+    --api-only|-a) API_ONLY=true ;;
+  esac
+done
+
+if $API_ONLY; then
+  echo "=== Stock Hawk 快速重启后端 ==="
+else
+  echo "=== Stock Hawk 启动 ==="
+fi
 echo "项目目录: $PROJECT_ROOT"
 
 mkdir -p .pids logs
+
+API_HOST="${API_HOST:-0.0.0.0}"
+API_PORT="${API_PORT:-8010}"
+WEB_HOST="${WEB_HOST:-127.0.0.1}"
+WEB_PORT="${WEB_PORT:-3010}"
+NEXT_PUBLIC_API_URL="${NEXT_PUBLIC_API_URL:-http://127.0.0.1:${API_PORT}/api}"
+export API_HOST API_PORT WEB_HOST WEB_PORT NEXT_PUBLIC_API_URL
 
 stop_service() {
     local service="$1"
@@ -19,21 +38,21 @@ stop_service() {
 
     local pid
     pid=$(cat "$pid_file")
-    if kill -0 "$pid" 2>/dev/null; then
+    if kill -0 "$pid" 2>/dev/null || kill -0 -- "-$pid" 2>/dev/null; then
         echo ">>> 停止已有 ${service} 服务 (PID: $pid)..."
-        kill "$pid"
+        kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
         for _ in $(seq 1 20); do
-            if ! kill -0 "$pid" 2>/dev/null; then
+            if ! kill -0 "$pid" 2>/dev/null && ! kill -0 -- "-$pid" 2>/dev/null; then
                 break
             fi
             sleep 0.2
         done
-        if kill -0 "$pid" 2>/dev/null; then
+        if kill -0 "$pid" 2>/dev/null || kill -0 -- "-$pid" 2>/dev/null; then
             echo "❌ ${service} 服务未能正常停止，请手动检查 PID: $pid"
             exit 1
         fi
     fi
-    rm -f "$pid_file"
+    rm -f "$pid_file" ".pids/${service}.port" ".pids/${service}.host"
 }
 
 find_node_path() {
@@ -63,6 +82,7 @@ find_node_path() {
 }
 
 # 1. 启动 Docker 容器
+if ! $API_ONLY; then
 if docker compose version &> /dev/null; then
     COMPOSE_CMD="docker compose"
 else
@@ -90,10 +110,21 @@ if [ $ELAPSED -ge $TIMEOUT ]; then
     echo "⚠️  容器启动超时，继续尝试启动服务..."
 fi
 
-# 3. 启动 FastAPI
+# 3. 执行数据库迁移
+echo ">>> 执行数据库迁移..."
+if command -v poetry >/dev/null 2>&1; then
+    poetry run alembic upgrade head
+else
+    python -m alembic upgrade head
+fi
+echo "✅ 数据库迁移完成"
+fi # end !API_ONLY
+
+# 4. 启动 FastAPI
 stop_service "api"
 echo ">>> 启动 API 服务..."
 API_PID=$(python -c '
+import os
 import pathlib
 import shutil
 import subprocess
@@ -102,10 +133,13 @@ import sys
 pathlib.Path(".pids").mkdir(exist_ok=True)
 pathlib.Path("logs").mkdir(exist_ok=True)
 
+api_host = os.environ.get("API_HOST", "0.0.0.0")
+api_port = os.environ.get("API_PORT", "8010")
+
 if shutil.which("poetry"):
-    cmd = ["poetry", "run", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    cmd = ["poetry", "run", "uvicorn", "api.main:app", "--host", api_host, "--port", api_port]
 else:
-    cmd = [sys.executable, "-m", "uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    cmd = [sys.executable, "-m", "uvicorn", "api.main:app", "--host", api_host, "--port", api_port]
 
 log = open("logs/api.log", "ab", buffering=0)
 proc = subprocess.Popen(
@@ -116,11 +150,34 @@ proc = subprocess.Popen(
     start_new_session=True,
 )
 pathlib.Path(".pids/api.pid").write_text(str(proc.pid))
+pathlib.Path(".pids/api.port").write_text(api_port)
+pathlib.Path(".pids/api.host").write_text(api_host)
 print(proc.pid)
 ')
 echo "✅ API 服务已启动 (PID: $API_PID)"
 
-# 4. 构建并启动 Web
+# 等待 API 就绪
+echo ">>> 等待 API 就绪..."
+for i in $(seq 1 15); do
+    if curl -s "http://127.0.0.1:${API_PORT}/health" > /dev/null 2>&1; then
+        echo "✅ API 健康检查通过"
+        break
+    fi
+    sleep 1
+done
+
+if $API_ONLY; then
+    echo ""
+    echo "=============================="
+    echo "  后端已重启"
+    echo "=============================="
+    echo "  API:    http://localhost:${API_PORT}"
+    echo "  日志:   tail -f ${PROJECT_ROOT}/logs/api.log"
+    echo ""
+    exit 0
+fi
+
+# 5. 构建并启动 Web
 echo ">>> 准备 Web 前端..."
 NODE_PATH_DIR=$(find_node_path) || {
     echo "❌ Web 前端需要 Node.js 20+。请安装 Node 20/22，或通过 nvm use 22 后重试。"
@@ -149,11 +206,13 @@ pathlib.Path(".pids").mkdir(exist_ok=True)
 pathlib.Path("logs").mkdir(exist_ok=True)
 
 env = os.environ.copy()
-env["NEXT_PUBLIC_API_URL"] = env.get("NEXT_PUBLIC_API_URL", "http://127.0.0.1:8000/api")
+web_host = env.get("WEB_HOST", "127.0.0.1")
+web_port = env.get("WEB_PORT", "3010")
+env["NEXT_PUBLIC_API_URL"] = env.get("NEXT_PUBLIC_API_URL", "http://127.0.0.1:8010/api")
 
 log = open("logs/web.log", "ab", buffering=0)
 proc = subprocess.Popen(
-    ["npm", "run", "start", "--", "--hostname", "127.0.0.1", "--port", "3000"],
+    ["npm", "run", "start", "--", "--hostname", web_host, "--port", web_port],
     cwd=root / "web",
     stdin=subprocess.DEVNULL,
     stdout=log,
@@ -162,20 +221,22 @@ proc = subprocess.Popen(
     env=env,
 )
 pathlib.Path(".pids/web.pid").write_text(str(proc.pid))
+pathlib.Path(".pids/web.port").write_text(web_port)
+pathlib.Path(".pids/web.host").write_text(web_host)
 print(proc.pid)
 ')
 echo "✅ Web 服务已启动 (PID: $WEB_PID)"
 
-# 5. 打印访问地址
+# 6. 打印访问地址
 echo ""
 echo "=============================="
 echo "  Stock Hawk 已启动"
 echo "=============================="
 echo ""
-echo "  Web:    http://localhost:3000"
-echo "  API:    http://localhost:8000"
-echo "  Health: http://localhost:8000/health"
-echo "  Docs:   http://localhost:8000/docs"
+echo "  Web:    http://localhost:${WEB_PORT}"
+echo "  API:    http://localhost:${API_PORT}"
+echo "  Health: http://localhost:${API_PORT}/health"
+echo "  Docs:   http://localhost:${API_PORT}/docs"
 echo ""
 echo "  停止服务: bash scripts/stop.sh"
 echo ""

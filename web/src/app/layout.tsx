@@ -3,8 +3,8 @@ import "./globals.css";
 import AntdProvider from "@/components/AntdProvider";
 
 export const metadata: Metadata = {
-  title: "Stock Hawk - 智能量化分析系统",
-  description: "A股产业链多维度信号分析",
+  title: "Stock Hawk",
+  description: "ETF 分析、持续上涨筛选与财经资讯中心",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

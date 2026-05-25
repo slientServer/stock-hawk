@@ -7,8 +7,6 @@ import {
 } from "antd";
 import { CheckCircleOutlined, CloseCircleOutlined, SaveOutlined, SyncOutlined } from "@ant-design/icons";
 import {
-  getAdvisorOverview,
-  getChainDiscoveryStatus,
   getSchedulerInfo,
   getSettings,
   testLlmSettings,
@@ -42,8 +40,6 @@ export default function SettingsPage() {
   const { message } = App.useApp();
   const [settings, setSettings] = useState<any>({});
   const [scheduler, setScheduler] = useState<any>({ jobs: [] });
-  const [advisor, setAdvisor] = useState<any>(null);
-  const [discovery, setDiscovery] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [testingLlm, setTestingLlm] = useState(false);
@@ -55,13 +51,9 @@ export default function SettingsPage() {
     Promise.all([
       getSettings().catch(() => ({})),
       getSchedulerInfo().catch(() => ({ jobs: [] })),
-      getAdvisorOverview().catch(() => null),
-      getChainDiscoveryStatus().catch(() => null),
-    ]).then(([s, sch, overview, discoveryStatus]) => {
+    ]).then(([s, sch]) => {
       setSettings(s);
       setScheduler(sch);
-      setAdvisor(overview);
-      setDiscovery(discoveryStatus);
       setLoading(false);
     });
   };
@@ -69,21 +61,14 @@ export default function SettingsPage() {
   useEffect(() => { loadData(); }, []);
 
   const llmConfigured = Boolean(settings.llm?.custom_configured);
-  const discoveryStatus = discovery?.result?.status;
-  const latestLlmError = discovery?.result?.error || "";
-  const latestLlmErrorHint = /readtimeout|timeout/i.test(latestLlmError)
-    ? "含义：Custom Base URL 可连接，但产业链发现的长上下文请求超时。需要换更快模型、提高网关/模型超时时间，或缩短产业链发现 prompt。"
-    : "";
-  const llmBlocked = discoveryStatus === "llm_unavailable" ||
-    advisor?.capabilities?.some((item: any) => item.key === "llm" && item.status === "blocked");
 
   const requirements = useMemo(() => [
     {
       key: "infra",
-      item: "PostgreSQL / Neo4j / Redis",
+      item: "PostgreSQL / Redis",
       level: "必填",
-      status: settings.database && settings.neo4j && settings.redis ? "ready" : "missing",
-      usage: "系统启动、行情存储、知识图谱和任务状态依赖",
+      status: settings.database && settings.redis ? "ready" : "missing",
+      usage: "系统启动、行情/资讯/分析结果存储和任务状态依赖",
       fill: "通常由 .env 和 Docker Compose 提供",
     },
     {
@@ -91,7 +76,7 @@ export default function SettingsPage() {
       item: "LLM 提供商",
       level: "必填",
       status: !llmConfigured ? "missing" : "ready",
-      usage: "自动发现产业链、产业链结构化、深度归因分析",
+      usage: "ETF 分析、持续上涨个股分析、资讯去重汇总",
       fill: "Custom Base URL / Token / Model",
     },
     {
@@ -99,7 +84,7 @@ export default function SettingsPage() {
       item: "Tushare Token",
       level: "完整能力必填",
       status: settings.data_source?.tushare_configured ? "ready" : "missing",
-      usage: "股票行业、财报、披露日、估值数据；缺失时部分路径降级到 AKShare",
+      usage: "ETF 份额/规模等增强数据；缺失时 ETF 分析会标注数据缺口",
       fill: "TUSHARE_TOKEN",
     },
     {
@@ -107,7 +92,7 @@ export default function SettingsPage() {
       item: "飞书 Webhook",
       level: "可选",
       status: settings.feishu?.webhook_configured ? "ready" : "optional",
-      usage: "后续用于预警和报告推送",
+      usage: "后续用于任务状态和重要结果通知",
       fill: "FEISHU_WEBHOOK_URL",
     },
   ], [settings, llmConfigured]);
@@ -209,7 +194,7 @@ export default function SettingsPage() {
           showIcon
           style={{ marginTop: 16 }}
           title="必填配置已就绪"
-          description="可以继续执行数据采集、产业链发现和投研分析流程。"
+          description="可以执行 ETF 分析、持续上涨分析和资讯中心汇总流程。"
         />
       )}
 
@@ -220,22 +205,8 @@ export default function SettingsPage() {
       <Form form={form} layout="vertical" onFinish={onSave}>
         <Card title="必填：LLM 提供商" style={{ marginTop: 16 }}>
           <Paragraph type="secondary">
-            自动发现产业链和深度归因统一走 Custom Base URL 配置，不再展示其他独立提供商配置。
+            ETF 分析、持续上涨个股分析和资讯中心汇总统一走 Custom Base URL 配置。
           </Paragraph>
-          {llmBlocked && (
-            <Alert
-              type="error"
-              showIcon
-              style={{ marginBottom: 16 }}
-              title="最近一次产业链发现任务的 LLM 调用失败"
-              description={
-                <Space orientation="vertical" size={4}>
-                  <Text>{latestLlmError || "这可能是历史任务结果；请点击下方测试按钮检查当前 Custom Base URL 是否可用。"}</Text>
-                  {latestLlmErrorHint && <Text type="secondary">{latestLlmErrorHint}</Text>}
-                </Space>
-              }
-            />
-          )}
           <Space wrap style={{ marginBottom: 12 }}>
             <Text strong>当前状态</Text>
             <Tag color={settings.llm?.custom_configured ? "success" : "default"}>Custom {settings.llm?.custom_configured ? "已配置" : "未配置"}</Tag>
@@ -282,7 +253,7 @@ export default function SettingsPage() {
 
         <Card title="完整能力必填：数据源" style={{ marginTop: 16 }}>
           <Paragraph type="secondary">
-            Tushare 用于补齐股票行业、财报、披露日和估值。实时板块源由系统内置真实行情接口自动处理，不需要在这里配置东方财富参数。
+            Tushare 用于补齐 ETF 份额、规模等增强数据；未配置时相关分析会标注数据缺口。
           </Paragraph>
           <Form.Item
             name="tushare_token"
@@ -325,9 +296,6 @@ export default function SettingsPage() {
           </Descriptions.Item>
           <Descriptions.Item label="PostgreSQL User">
             {settings.database?.user || "-"}
-          </Descriptions.Item>
-          <Descriptions.Item label="Neo4j">
-            {settings.neo4j?.uri || "-"}
           </Descriptions.Item>
           <Descriptions.Item label="Redis">
             {settings.redis?.url || "-"}

@@ -11,6 +11,16 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agents.tools.base_tool import BaseTool, ToolResult
 from common.models import DailyKline, FinancialReport, Signal, Stock
+from common.stock_service import (
+    build_picks,
+    candidate_data_counts,
+    chain_maps,
+    data_counts,
+    financial_payload,
+    kline_metrics,
+    normalize_code,
+    num,
+)
 
 
 def _num(value: Any) -> float | None:
@@ -25,16 +35,7 @@ def _num(value: Any) -> float | None:
 
 
 def normalize_stock_code(value: Any) -> str | None:
-    text = str(value or "").strip().upper()
-    if not text:
-        return None
-    if "." in text:
-        text = text.split(".", 1)[0]
-    if text.startswith(("SH", "SZ", "BJ")):
-        text = text[2:]
-    if not text.isdigit():
-        return None
-    return text.zfill(6)
+    return normalize_code(value)
 
 
 def extract_stock_codes(text: str) -> list[str]:
@@ -93,20 +94,16 @@ class StockDataTools(BaseTool):
 
     async def get_coverage(self) -> ToolResult:
         async def _execute():
-            from api.routes.advisor import _candidate_data_counts, _data_counts
-
             async with self._session_factory() as session:
-                counts = await _data_counts(session)
-                candidate_counts = await _candidate_data_counts(session)
+                counts = await data_counts(session)
+                candidate_counts = await candidate_data_counts(session)
             return {**counts, **candidate_counts}
 
         return await self._safe_execute(_execute())
 
     async def list_chains(self) -> ToolResult:
         async def _execute():
-            from api.routes.advisor import _chain_maps
-
-            chains, _ = await _chain_maps()
+            chains, _ = await chain_maps()
             result = []
             for chain in chains:
                 name = chain.get("name") or chain.get("chain_name") or chain.get("chain_id")
@@ -132,11 +129,9 @@ class StockDataTools(BaseTool):
         risk_tolerance: str | None = None,
     ) -> ToolResult:
         async def _execute():
-            from api.routes.advisor import _build_picks
-
             bounded_limit = max(1, min(int(limit or 20), 100))
             async with self._session_factory() as session:
-                picks = await _build_picks(session, limit=100)
+                picks = await build_picks(session, limit=100)
 
             items = list(picks.get("items") or [])
             if chain_name:
@@ -173,8 +168,6 @@ class StockDataTools(BaseTool):
         periods: int = 8,
     ) -> ToolResult:
         async def _execute():
-            from api.routes.advisor import _chain_maps, _financial_payload, _kline_metrics
-
             normalized = normalize_stock_code(code)
             if not normalized:
                 raise ValueError(f"Invalid stock code: {code}")
@@ -211,7 +204,7 @@ class StockDataTools(BaseTool):
                     )
                 ).scalars().all()
 
-            _, chain_by_code = await _chain_maps()
+            _, chain_by_code = await chain_maps()
             signals = self._filter_signals_for_code(signal_rows, normalized)[:20]
             data_gaps = []
             if not stock:
@@ -227,8 +220,8 @@ class StockDataTools(BaseTool):
                 "code": normalized,
                 "stock": self._stock_payload(stock),
                 "chain_exposure": chain_by_code.get(normalized, []),
-                "metrics": _kline_metrics(kline_rows),
-                "latest_financial": _financial_payload(financial_rows[0]) if financial_rows else None,
+                "metrics": kline_metrics(kline_rows),
+                "latest_financial": financial_payload(financial_rows[0]) if financial_rows else None,
                 "financial_history": [self._financial_row_payload(row) for row in financial_rows],
                 "recent_signals": [self._signal_payload(row) for row in signals],
                 "data_quality": {
@@ -313,7 +306,7 @@ class StockDataTools(BaseTool):
             "name": stock.name,
             "industry": stock.industry,
             "market": stock.market,
-            "market_cap": _num(stock.market_cap),
+            "market_cap": num(stock.market_cap),
             "is_st": stock.is_st,
         }
 
@@ -322,14 +315,14 @@ class StockDataTools(BaseTool):
         return {
             "report_date": str(row.report_date) if row.report_date else None,
             "publish_date": str(row.publish_date) if row.publish_date else None,
-            "revenue": _num(row.revenue),
-            "revenue_yoy": _num(row.revenue_yoy),
-            "net_profit": _num(row.net_profit),
-            "net_profit_yoy": _num(row.net_profit_yoy),
-            "gross_margin": _num(row.gross_margin),
-            "roe": _num(row.roe),
-            "pe_ratio": _num(row.pe_ratio),
-            "pb_ratio": _num(row.pb_ratio),
+            "revenue": num(row.revenue),
+            "revenue_yoy": num(row.revenue_yoy),
+            "net_profit": num(row.net_profit),
+            "net_profit_yoy": num(row.net_profit_yoy),
+            "gross_margin": num(row.gross_margin),
+            "roe": num(row.roe),
+            "pe_ratio": num(row.pe_ratio),
+            "pb_ratio": num(row.pb_ratio),
             "source": row.source,
         }
 
@@ -340,8 +333,8 @@ class StockDataTools(BaseTool):
             "chain_id": signal.chain_id,
             "source_entity": signal.source_entity,
             "target_codes": signal.target_codes,
-            "strength": _num(signal.strength),
-            "confidence": _num(signal.confidence),
+            "strength": num(signal.strength),
+            "confidence": num(signal.confidence),
             "detail": signal.detail,
             "trigger_date": str(signal.trigger_date) if signal.trigger_date else None,
             "source": signal.source,

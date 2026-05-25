@@ -6,6 +6,7 @@ from sqlalchemy import (
     Boolean,
     Date,
     DateTime,
+    Float,
     Index,
     Integer,
     Numeric,
@@ -283,6 +284,73 @@ class NewsEvent(Base):
     )
 
 
+class FinanceNewsSource(Base):
+    __tablename__ = "finance_news_sources"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(100))
+    url: Mapped[str] = mapped_column(String(1000))
+    source_type: Mapped[str] = mapped_column(String(30), default="rss", index=True)
+    category: Mapped[str | None] = mapped_column(String(50), index=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("source_type", "url", name="uq_finance_news_sources_type_url"),
+        Index("ix_finance_news_sources_enabled", "enabled"),
+    )
+
+
+class FinanceNewsArticle(Base):
+    __tablename__ = "finance_news_articles"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    source_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    source_name: Mapped[str | None] = mapped_column(String(100), index=True)
+    title: Mapped[str] = mapped_column(String(500))
+    url: Mapped[str | None] = mapped_column(String(1000))
+    content: Mapped[str | None] = mapped_column(Text)
+    published_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    fetched_at: Mapped[datetime | None] = mapped_column(DateTime, server_default=func.now(), index=True)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    raw_metadata: Mapped[dict | None] = mapped_column(JSON)
+
+    __table_args__ = (
+        UniqueConstraint("content_hash"),
+        Index("ix_finance_news_articles_content_hash", "content_hash"),
+        Index("ix_finance_news_articles_published_source", "published_at", "source_name"),
+    )
+
+
+class FinanceDailySummary(Base):
+    __tablename__ = "finance_daily_summaries"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    summary_date: Mapped[date] = mapped_column(Date)
+    generated_at: Mapped[datetime | None] = mapped_column(DateTime, server_default=func.now(), index=True)
+    title: Mapped[str | None] = mapped_column(String(200))
+    content: Mapped[str | None] = mapped_column(Text)
+    key_points: Mapped[list | None] = mapped_column(JSON)
+    watch_items: Mapped[list | None] = mapped_column(JSON)
+    article_ids: Mapped[list | None] = mapped_column(JSON)
+    source_names: Mapped[list | None] = mapped_column(JSON)
+    article_count: Mapped[int | None] = mapped_column(Integer)
+    source_count: Mapped[int | None] = mapped_column(Integer)
+    llm_used: Mapped[bool | None] = mapped_column(Boolean, default=False)
+    model: Mapped[str | None] = mapped_column(String(100))
+    status: Mapped[str | None] = mapped_column(String(20), default="ok", index=True)
+    data_gaps: Mapped[list | None] = mapped_column(JSON)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("summary_date"),
+        Index("ix_finance_daily_summaries_summary_date", "summary_date"),
+        Index("ix_finance_daily_summaries_date_generated", "summary_date", "generated_at"),
+    )
+
+
 class OverseasStock(Base):
     __tablename__ = "overseas_stocks"
 
@@ -534,7 +602,7 @@ class EtfAnalysisRecord(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     task_id: Mapped[str | None] = mapped_column(String(50), index=True)
-    analysis_time: Mapped[datetime | None] = mapped_column(DateTime, server_default=func.now(), index=True)
+    analysis_time: Mapped[datetime | None] = mapped_column(DateTime, server_default=func.now())
     trigger_type: Mapped[str | None] = mapped_column(String(20))
     etf_count: Mapped[int | None] = mapped_column(Integer)
     hot_sectors: Mapped[dict | None] = mapped_column(JSON)
@@ -549,4 +617,120 @@ class EtfAnalysisRecord(Base):
 
     __table_args__ = (
         Index("ix_etf_analysis_records_time", "analysis_time"),
+    )
+
+
+class SectorCatalyst(Base):
+    __tablename__ = "sector_catalysts"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    trade_date: Mapped[date | None] = mapped_column(Date, index=True)
+    sector_name: Mapped[str | None] = mapped_column(String(100))
+    catalyst_strength: Mapped[int | None] = mapped_column(Integer)  # 1-5
+    catalyst_type: Mapped[str | None] = mapped_column(String(50))
+    summary: Mapped[str | None] = mapped_column(Text)
+    related_news_ids: Mapped[list | None] = mapped_column(JSON)
+    related_codes: Mapped[list | None] = mapped_column(JSON)
+    llm_used: Mapped[bool | None] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("trade_date", "sector_name", name="uq_sector_catalysts_date_sector"),
+        Index("ix_sector_catalysts_trade_date", "trade_date"),
+    )
+
+
+class PreMarketResult(Base):
+    __tablename__ = "pre_market_results"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    trade_date: Mapped[date | None] = mapped_column(Date, index=True)
+    result_type: Mapped[str | None] = mapped_column(String(20))  # "aggressive" | "stable"
+    code: Mapped[str | None] = mapped_column(String(10), index=True)
+    name: Mapped[str | None] = mapped_column(String(100))
+    close_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+
+    # 激进标专用
+    change_pct_5d: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    change_pct_1d: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    turnover_rate: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    volume_ratio: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    market_cap: Mapped[Decimal | None] = mapped_column(Numeric(16, 2))
+    main_net_1d: Mapped[Decimal | None] = mapped_column(Numeric(16, 2))
+    main_net_3d: Mapped[Decimal | None] = mapped_column(Numeric(16, 2))
+    above_ma5: Mapped[bool | None] = mapped_column(Boolean)
+    catalyst_sector: Mapped[str | None] = mapped_column(String(100))
+    catalyst_strength: Mapped[int | None] = mapped_column(Integer)
+
+    # 稳健标专用
+    change_pct_3d: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    ma5_direction: Mapped[str | None] = mapped_column(String(10))  # "up"|"flat"|"down"
+    ma5_deviation: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    amount_ratio: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    avg_amplitude: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+
+    # 共有字段
+    score: Mapped[Decimal | None] = mapped_column(Numeric(6, 2))
+    score_detail: Mapped[dict | None] = mapped_column(JSON)
+    rank: Mapped[int | None] = mapped_column(Integer)
+    target_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    stop_loss_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    suggestion: Mapped[str | None] = mapped_column(Text)
+
+    # 绩效追踪字段（T+1～T+3 自动回填）
+    actual_return_pct: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    actual_exit_date: Mapped[date | None] = mapped_column(Date)
+    actual_exit_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
+    exit_type: Mapped[str | None] = mapped_column(String(20))  # "take_profit"|"stop_loss"|"max_hold"|"pending"
+
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("code", "trade_date", "result_type", name="uq_pre_market_results_code_date_type"),
+        Index("ix_pre_market_results_date_type", "trade_date", "result_type"),
+        Index("ix_pre_market_results_date_score", "trade_date", "score"),
+        Index("ix_pre_market_results_exit_type", "exit_type"),
+    )
+
+
+class WatchlistItem(Base):
+    """关注列表：支持3种盯盘模式 + 飞书自动推送。"""
+
+    __tablename__ = "watchlist_items"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(20), nullable=False)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    industry: Mapped[str | None] = mapped_column(String(100))
+    source: Mapped[str] = mapped_column(String(30), default="manual")
+    # source: manual / pre_market / etf / ten_bagger
+
+    # Mode 1: 目标价触发
+    mode1_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    mode1_target_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))   # 上涨触发
+    mode1_floor_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))    # 下跌触发
+
+    # Mode 2: 基准涨跌幅触发
+    mode2_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    mode2_base_price: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))     # 添加时自动取实时价
+    mode2_up_pct: Mapped[float | None] = mapped_column(Float)                    # 上涨 X% 触发
+    mode2_down_pct: Mapped[float | None] = mapped_column(Float)                  # 下跌 X% 触发（正值）
+
+    # Mode 3: RSI14 超卖回升（从 <30 回升至 >=30）
+    mode3_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # 推送去重（持久化，避免重启后重复推）
+    last_notified_mode1: Mapped[str | None] = mapped_column(String(20))   # "target"/"floor"/None
+    last_notified_mode2: Mapped[str | None] = mapped_column(String(20))   # "up"/"down"/None
+    last_notified_mode3_date: Mapped[str | None] = mapped_column(String(10))  # YYYY-MM-DD
+
+    note: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(20), default="active")     # active / paused
+
+    created_at: Mapped[datetime | None] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("ix_watchlist_items_code", "code"),
+        Index("ix_watchlist_items_status", "status"),
     )

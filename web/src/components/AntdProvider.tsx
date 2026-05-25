@@ -3,18 +3,11 @@
 import { ConfigProvider, App, Layout, Menu } from "antd";
 import {
   HomeOutlined,
-  ThunderboltOutlined,
-  FileTextOutlined,
-  LineChartOutlined,
-  ApartmentOutlined,
-  AuditOutlined,
   SettingOutlined,
-  DatabaseOutlined,
-  RadarChartOutlined,
-  StockOutlined,
-  WalletOutlined,
-  BarChartOutlined,
   FundOutlined,
+  RadarChartOutlined,
+  RiseOutlined,
+  ReadOutlined,
 } from "@ant-design/icons";
 import { usePathname, useRouter } from "next/navigation";
 import zhCN from "antd/locale/zh_CN";
@@ -23,40 +16,22 @@ import type { ReactNode } from "react";
 const { Header, Content } = Layout;
 
 const NAV_ITEMS = [
-  { key: "/advisor", label: "投研", icon: <RadarChartOutlined /> },
-  { key: "/stock-analysis", label: "个股分析", icon: <BarChartOutlined /> },
+  { key: "/", label: "工作台", icon: <HomeOutlined /> },
   { key: "/etf-analysis", label: "ETF分析", icon: <FundOutlined /> },
-  { key: "/portfolio", label: "持仓", icon: <WalletOutlined /> },
-  { key: "/graph", label: "图谱", icon: <ApartmentOutlined /> },
-  { key: "/signals", label: "信号中心", icon: <ThunderboltOutlined /> },
-  { key: "/eod-screener", label: "尾盘选股", icon: <StockOutlined /> },
-  { key: "/reports", label: "研报库", icon: <FileTextOutlined /> },
-  { key: "/backtest", label: "回测", icon: <LineChartOutlined /> },
+  { key: "/ten-bagger", label: "持续上涨", icon: <RiseOutlined /> },
+  { key: "/pre-market", label: "盘前选股", icon: <RadarChartOutlined /> },
+  { key: "/news-center", label: "资讯中心", icon: <ReadOutlined /> },
   { key: "/settings", label: "设置", icon: <SettingOutlined /> },
-  {
-    key: "management",
-    label: "管理",
-    icon: <DatabaseOutlined />,
-    children: [
-      { key: "/", label: "总览", icon: <HomeOutlined /> },
-      { key: "/data", label: "数据", icon: <DatabaseOutlined /> },
-      { key: "/audit", label: "审计", icon: <AuditOutlined /> },
-    ],
-  },
 ];
 
 export default function AntdProvider({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
 
-  const selectedKey = pathname.startsWith("/chain/")
-    ? "/graph"
-    : pathname.startsWith("/stock/")
-      ? "/advisor"
-      : pathname === "/"
-        ? "/"
-        : NAV_ITEMS.flatMap((n) => n.children ? n.children : [n]).find((n) => n.key !== "/" && pathname.startsWith(n.key))?.key ?? "/";
-  const wideContent = pathname.startsWith("/advisor") || pathname.startsWith("/stock-analysis") || pathname.startsWith("/etf-analysis");
+  const selectedKey = pathname === "/"
+    ? "/"
+    : NAV_ITEMS.find((n) => n.key !== "/" && pathname.startsWith(n.key))?.key ?? "/";
+  const wideContent = pathname.startsWith("/etf-analysis") || pathname.startsWith("/news-center") || pathname.startsWith("/pre-market");
 
   return (
     <ConfigProvider

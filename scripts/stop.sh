@@ -12,13 +12,13 @@ if [ -d .pids ]; then
         if [ -f "$pid_file" ]; then
             PID=$(cat "$pid_file")
             SERVICE=$(basename "$pid_file" .pid)
-            if kill -0 "$PID" 2>/dev/null; then
-                kill "$PID"
+            if kill -0 "$PID" 2>/dev/null || kill -0 -- "-$PID" 2>/dev/null; then
+                kill -- "-$PID" 2>/dev/null || kill "$PID" 2>/dev/null || true
                 echo "✅ 已停止 $SERVICE (PID: $PID)"
             else
                 echo "ℹ️  $SERVICE (PID: $PID) 已经停止"
             fi
-            rm -f "$pid_file"
+            rm -f "$pid_file" ".pids/${SERVICE}.port" ".pids/${SERVICE}.host"
         fi
     done
 else

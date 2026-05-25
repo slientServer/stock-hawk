@@ -8,15 +8,21 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import desc, func, select
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from agents.tools.notification_tools import NotificationTools
 from api.deps import get_db
+from common.logger import get_logger
 from common.models import DailyKline, PortfolioPosition, PortfolioTransaction, Stock
 from data_collector.cache.redis_cache import RedisCache
 from data_collector.sources.market_realtime import RealtimeCollector
 from eod_screener.config import EODScreenerConfig
 
+logger = get_logger(__name__)
 router = APIRouter(prefix="/portfolio", tags=["持仓管理"])
+
+# 已推送过的阈值状态，避免重复推送: {position_id: last_notified_status}
+_NOTIFIED: dict[int, str] = {}
 
 
 class PositionCreateRequest(BaseModel):
@@ -535,3 +541,72 @@ async def list_transactions(
         await db.execute(stmt.order_by(desc(PortfolioTransaction.created_at), desc(PortfolioTransaction.id)).limit(limit))
     ).scalars().all()
     return [_transaction_payload(row) for row in rows]
+
+
+# ── 盯盘主动推送 ──────────────────────────────────────────────────────────────
+
+
+async def check_and_notify_positions(session_factory: async_sessionmaker[AsyncSession]) -> dict[str, Any]:
+    """
+    检查所有活跃持仓的止损/止盈状态，触发时推送飞书通知。
+    同一持仓同一状态只推送一次，恢复 holding 后重置计数。
+    供 AgentScheduler 在盘中（9:25-15:05）每 5 分钟调用。
+    """
+    notifier = NotificationTools()
+    if not notifier.is_available():
+        return {"status": "skipped", "reason": "飞书未配置"}
+
+    async with session_factory() as db:
+        rows = (
+            await db.execute(
+                select(PortfolioPosition).where(PortfolioPosition.status == "active")
+            )
+        ).scalars().all()
+
+    if not rows:
+        return {"status": "ok", "checked": 0, "notified": 0}
+
+    quotes = {}
+    async with session_factory() as db:
+        quotes = await _quotes_for_codes(db, [r.code for r in rows])
+
+    notified = 0
+    for row in rows:
+        quote = quotes.get(row.code)
+        item = _position_payload(row, quote)
+        status = item["threshold_status"]
+        pid = row.id
+
+        # 恢复正常持仓时清除已推送记录
+        if status == "holding":
+            _NOTIFIED.pop(pid, None)
+            continue
+
+        # 只推送 take_profit / stop_loss，且同状态不重复推送
+        if status not in ("take_profit", "stop_loss"):
+            continue
+        if _NOTIFIED.get(pid) == status:
+            continue
+
+        emoji = "🎯" if status == "take_profit" else "🛑"
+        label = "止盈" if status == "take_profit" else "止损"
+        price = item.get("current_price") or 0
+        threshold = item.get("target_price") if status == "take_profit" else item.get("stop_loss_price")
+        ret_pct = item.get("unrealized_return_pct")
+        ret_str = f"{ret_pct:+.2f}%" if ret_pct is not None else "N/A"
+
+        msg = (
+            f"CtxHub {emoji}【持仓{label}提醒】\n"
+            f"{item.get('name', '')}({item.get('code', '')})\n"
+            f"当前价: {price:.3f}  |  {label}价: {threshold:.3f}\n"
+            f"持仓浮动: {ret_str}  |  {item.get('action_advice', '')}"
+        )
+        result = await notifier.send_feishu(msg)
+        if result.success:
+            _NOTIFIED[pid] = status
+            notified += 1
+            logger.info(f"[PortfolioMonitor] {label}提醒已推送: {item.get('code')} {label}价={threshold}")
+        else:
+            logger.warning(f"[PortfolioMonitor] 推送失败: {result.error}")
+
+    return {"status": "ok", "checked": len(rows), "notified": notified}
