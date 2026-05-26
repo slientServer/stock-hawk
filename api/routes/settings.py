@@ -235,3 +235,22 @@ async def scheduler_info(request: Request) -> dict[str, Any]:
         "status": "not_started",
         "running": [],
     }
+
+
+@router.post("/workflows/trigger")
+async def trigger_workflow(request: Request, body: dict[str, Any]) -> dict[str, Any]:
+    """手动触发指定工作流。
+    workflow_type 可选值: daily_kline / main_flow / etf_analysis / pre_market / pre_market_perf / finance_news
+    """
+    workflow_type = body.get("workflow_type", "")
+    if not workflow_type:
+        return {"error": "workflow_type 不能为空"}
+    scheduler = getattr(request.app.state, "agent_scheduler", None)
+    if not scheduler:
+        return {"error": "调度器未启动"}
+    kwargs = {k: v for k, v in body.items() if k != "workflow_type"}
+    try:
+        result = await scheduler.trigger_manual(workflow_type, **kwargs)
+        return {"workflow_type": workflow_type, "result": result}
+    except Exception as e:
+        return {"error": str(e), "workflow_type": workflow_type}
