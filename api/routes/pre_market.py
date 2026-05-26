@@ -450,7 +450,8 @@ async def get_performance(
             await session.execute(
                 select(PreMarketResult).where(
                     PreMarketResult.trade_date >= since,
-                    PreMarketResult.exit_type.notin_(["pending", None]),
+                    PreMarketResult.exit_type.isnot(None),
+                    PreMarketResult.exit_type.notin_(["pending"]),
                 )
             )
         ).scalars().all()
@@ -474,8 +475,8 @@ async def get_performance(
             "profit_loss_ratio": round(pl_ratio, 4) if pl_ratio else None,
         }
 
-    agg_rows = [r for r in rows if r.result_type == "aggressive"]
-    stable_rows = [r for r in rows if r.result_type == "stable"]
+    agg_rows = [r for r in rows if r.result_type in ("aggressive", "aggressive_main", "aggressive_backup")]
+    stable_rows = [r for r in rows if r.result_type in ("stable", "stable_stock")]
     return {
         "since": str(since),
         "aggressive": _stats(agg_rows),
