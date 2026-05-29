@@ -2,20 +2,35 @@
 
 import { useEffect, useMemo, useState } from "react";
 import {
-  Alert, App, Button, Card, Descriptions, Form, Input, Select,
-  Space, Spin, Table, Tag, Typography,
+  Alert, App, Button, Card, Col, Descriptions, Form, Input, Progress, Row,
+  Select, Space, Spin, Statistic, Table, Tag, Typography,
 } from "antd";
-import { CheckCircleOutlined, CloseCircleOutlined, SaveOutlined, SyncOutlined } from "@ant-design/icons";
 import {
+  CheckCircleOutlined, CloseCircleOutlined, PlayCircleOutlined,
+  SaveOutlined, SyncOutlined,
+} from "@ant-design/icons";
+import {
+  getDataCompleteness,
   getSchedulerInfo,
   getSettings,
+  getStatsDetail,
   testLlmSettings,
+  triggerWorkflow,
   updateSettings,
 } from "@/lib/api";
 
 const { Title, Text, Paragraph } = Typography;
 
 type ConfigStatus = "ready" | "missing" | "blocked" | "optional";
+
+const JOB_WORKFLOW_MAP: Record<string, string> = {
+  finance_news_hourly: "finance_news",
+  etf_analysis: "etf_analysis",
+  pre_market_screen: "pre_market",
+  pre_market_perf: "pre_market_perf",
+  daily_kline_update: "daily_kline",
+  main_flow_update: "main_flow",
+};
 
 function StatusTag({ status }: { status: ConfigStatus }) {
   const meta = {
@@ -45,15 +60,22 @@ export default function SettingsPage() {
   const [testingLlm, setTestingLlm] = useState(false);
   const [llmTest, setLlmTest] = useState<any>(null);
   const [form] = Form.useForm();
+  const [triggeringJobs, setTriggeringJobs] = useState<Record<string, boolean>>({});
+  const [statsDetail, setStatsDetail] = useState<any>(null);
+  const [dataCompleteness, setDataCompleteness] = useState<any>(null);
 
   const loadData = () => {
     setLoading(true);
     Promise.all([
       getSettings().catch(() => ({})),
       getSchedulerInfo().catch(() => ({ jobs: [] })),
-    ]).then(([s, sch]) => {
+      getStatsDetail().catch(() => null),
+      getDataCompleteness().catch(() => null),
+    ]).then(([s, sch, stats, completeness]) => {
       setSettings(s);
       setScheduler(sch);
+      setStatsDetail(stats);
+      setDataCompleteness(completeness);
       setLoading(false);
     });
   };
@@ -61,6 +83,27 @@ export default function SettingsPage() {
   useEffect(() => { loadData(); }, []);
 
   const llmConfigured = Boolean(settings.llm?.custom_configured);
+
+  const handleTrigger = async (jobId: string) => {
+    const workflowType = JOB_WORKFLOW_MAP[jobId];
+    if (!workflowType) {
+      message.warning("该任务暂不支持手动触发");
+      return;
+    }
+    setTriggeringJobs((prev) => ({ ...prev, [jobId]: true }));
+    try {
+      const res = await triggerWorkflow(workflowType);
+      if (res.error) {
+        message.error(`触发失败: ${res.error}`);
+      } else {
+        message.success(`工作流 ${workflowType} 已触发`);
+      }
+    } catch (e: any) {
+      message.error(`触发异常: ${e.message}`);
+    } finally {
+      setTriggeringJobs((prev) => ({ ...prev, [jobId]: false }));
+    }
+  };
 
   const requirements = useMemo(() => [
     {
@@ -112,6 +155,26 @@ export default function SettingsPage() {
   const schedulerColumns = [
     { title: "任务名", dataIndex: "name", key: "name" },
     { title: "下次执行", dataIndex: "next_run", key: "next_run", render: (v: string) => v || "-" },
+    {
+      title: "操作",
+      key: "action",
+      width: 130,
+      render: (_: any, record: any) => {
+        const canTrigger = JOB_WORKFLOW_MAP[record.id] !== undefined;
+        return (
+          <Button
+            type="link"
+            size="small"
+            icon={<PlayCircleOutlined />}
+            disabled={!canTrigger}
+            loading={triggeringJobs[record.id] || false}
+            onClick={() => handleTrigger(record.id)}
+          >
+            立即执行
+          </Button>
+        );
+      },
+    },
   ];
 
   const onSave = async (values: any) => {
@@ -312,6 +375,81 @@ export default function SettingsPage() {
           size="small"
           locale={{ emptyText: "无调度任务" }}
         />
+      </Card>
+
+      <Card title="数据概览" style={{ marginTop: 16 }}>
+        {dataCompleteness && (
+          <div style={{ marginBottom: 24, textAlign: "center" }}>
+            <Progress
+              type="dashboard"
+              percent={dataCompleteness.overall_score ?? 0}
+              format={(pct) => `${pct}分`}
+            />
+            <Text type="secondary" style={{ display: "block", marginTop: 8 }}>
+              数据完备性综合评分
+            </Text>
+          </div>
+        )}
+
+        {statsDetail && (
+          <Row gutter={[16, 16]}>
+            <Col span={8}>
+              <Statistic title="股票总数" value={statsDetail.stocks?.total ?? 0} />
+            </Col>
+            <Col span={8}>
+              <Statistic title="日K线记录" value={statsDetail.klines?.total ?? 0} />
+              <Text type="secondary">
+                覆盖 {statsDetail.klines?.stock_coverage ?? 0} 只股票
+                {statsDetail.klines?.date_to && ` | 最新: ${statsDetail.klines.date_to}`}
+              </Text>
+            </Col>
+            <Col span={8}>
+              <Statistic title="资金流记录" value={statsDetail.fund_flow?.total ?? 0} />
+              <Text type="secondary">
+                {statsDetail.fund_flow?.date_to ? `最新: ${statsDetail.fund_flow.date_to}` : "暂无数据"}
+              </Text>
+            </Col>
+            <Col span={8}>
+              <Statistic title="财报记录" value={statsDetail.financials?.total ?? 0} />
+              <Text type="secondary">
+                覆盖 {statsDetail.financials?.stock_coverage ?? 0} 只股票
+                {statsDetail.financials?.date_to && ` | 最新: ${statsDetail.financials.date_to}`}
+              </Text>
+            </Col>
+            <Col span={8}>
+              <Statistic title="股东户数记录" value={statsDetail.shareholders?.total ?? 0} />
+              <Text type="secondary">
+                覆盖 {statsDetail.shareholders?.stock_coverage ?? 0} 只股票
+                {statsDetail.shareholders?.date_to && ` | 最新: ${statsDetail.shareholders.date_to}`}
+              </Text>
+            </Col>
+          </Row>
+        )}
+
+        {!statsDetail && !dataCompleteness && (
+          <Text type="secondary">暂无数据统计信息</Text>
+        )}
+
+        {dataCompleteness?.recommendations?.length > 0 && (
+          <div style={{ marginTop: 24 }}>
+            <Text strong>修复建议</Text>
+            <Table
+              dataSource={dataCompleteness.recommendations}
+              rowKey={(r: any) => r.task || r.action}
+              pagination={false}
+              size="small"
+              style={{ marginTop: 8 }}
+              columns={[
+                {
+                  title: "优先级", dataIndex: "priority", key: "priority", width: 80,
+                  render: (v: string) => <Tag color={v === "P0" ? "red" : "orange"}>{v}</Tag>,
+                },
+                { title: "操作", dataIndex: "action", key: "action" },
+                { title: "影响", dataIndex: "impact", key: "impact" },
+              ]}
+            />
+          </div>
+        )}
       </Card>
     </div>
   );

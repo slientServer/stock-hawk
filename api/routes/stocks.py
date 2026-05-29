@@ -622,6 +622,15 @@ async def get_data_stats_detail(db: AsyncSession = Depends(get_db)):
     # 信号统计
     signal_count = (await db.execute(select(func.count()).select_from(Signal))).scalar() or 0
 
+    # 股东户数统计
+    shareholder_count = (await db.execute(select(func.count()).select_from(ShareholderCount))).scalar() or 0
+    shareholder_stocks = (await db.execute(select(func.count(distinct(ShareholderCount.code))))).scalar() or 0
+    shareholder_date_range = (await db.execute(
+        select(func.min(ShareholderCount.end_date), func.max(ShareholderCount.end_date))
+    )).one_or_none()
+    shareholder_min_date = str(shareholder_date_range[0]) if shareholder_date_range and shareholder_date_range[0] else None
+    shareholder_max_date = str(shareholder_date_range[1]) if shareholder_date_range and shareholder_date_range[1] else None
+
     # 最近K线采集（按日期分组统计最近10天）
     recent_kline_stmt = (
         select(DailyKline.trade_date, func.count().label("count"))
@@ -658,6 +667,12 @@ async def get_data_stats_detail(db: AsyncSession = Depends(get_db)):
         },
         "signals": {
             "total": signal_count,
+        },
+        "shareholders": {
+            "total": shareholder_count,
+            "stock_coverage": shareholder_stocks,
+            "date_from": shareholder_min_date,
+            "date_to": shareholder_max_date,
         },
     }
 

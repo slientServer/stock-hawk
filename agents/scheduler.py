@@ -65,8 +65,8 @@ class AgentScheduler:
             self._run_daily_kline_update,
             "cron",
             day_of_week="mon-fri",
-            hour=15,
-            minute=30,
+            hour=17,
+            minute=0,
             id="daily_kline_update",
             name="每日收盘后全市场日K线更新",
             max_instances=1,
@@ -76,8 +76,8 @@ class AgentScheduler:
             self._run_main_flow_update,
             "cron",
             day_of_week="mon-fri",
-            hour=15,
-            minute=45,
+            hour=19,
+            minute=0,
             id="main_flow_update",
             name="每日收盘后主力资金流更新",
             max_instances=1,
@@ -224,6 +224,7 @@ class AgentScheduler:
 
     async def _run_daily_kline_update_manual(self) -> dict[str, Any]:
         try:
+            from datetime import datetime
             from data_collector.sources.market_kline import KlineCollector
             from data_collector.storage import DataStorage
             from data_collector.cache.redis_cache import RedisCache
@@ -231,7 +232,13 @@ class AgentScheduler:
             storage = DataStorage(self._session_factory)
             cache = RedisCache()
             collector = KlineCollector(storage, cache)
-            return await collector.collect_full_market_daily(lookback_days=5)
+            # 17:00 之前 Tushare 日频数据通常未入库，优先用实时源拿当天数据
+            now = datetime.now()
+            if now.hour < 17:
+                mode = "intraday"
+            else:
+                mode = "auto"
+            return await collector.collect_full_market_daily(lookback_days=5, mode=mode)
         except Exception as e:
             logger.error("Daily kline update manual failed: %s", e)
             return {"status": "failed", "error": str(e)}
@@ -248,7 +255,7 @@ class AgentScheduler:
 
     async def _run_main_flow_update_manual(self) -> dict[str, Any]:
         try:
-            from datetime import date
+            from datetime import date, timedelta
             from data_collector.sources.main_flow import MainFlowCollector
             from data_collector.storage import DataStorage
             from data_collector.cache.redis_cache import RedisCache
@@ -256,8 +263,13 @@ class AgentScheduler:
             storage = DataStorage(self._session_factory)
             cache = RedisCache()
             collector = MainFlowCollector(storage, cache)
-            records = await collector.collect_tushare_moneyflow(date.today())
-            return {"status": "completed", "records": records}
+            # 从今天开始尝试，如果无数据则回退到前一天（Tushare 资金流数据通常延迟到晚间入库）
+            for offset in range(4):
+                target = date.today() - timedelta(days=offset)
+                records = await collector.collect_tushare_moneyflow(target)
+                if records > 0:
+                    return {"status": "completed", "records": records, "trade_date": str(target)}
+            return {"status": "completed", "records": 0, "note": "近4天均无数据"}
         except Exception as e:
             logger.error("Main flow update manual failed: %s", e)
             return {"status": "failed", "error": str(e)}

@@ -256,6 +256,19 @@ export async function testLlmSettings(data: { custom_base_url?: string } = {}) {
     body: JSON.stringify(data),
   });
 }
+export async function triggerWorkflow(workflowType: string) {
+  return fetchAPI<any>("/settings/workflows/trigger", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ workflow_type: workflowType }),
+  });
+}
+export async function getStatsDetail() {
+  return fetchAPI<any>("/stocks/stats/detail");
+}
+export async function getDataCompleteness() {
+  return fetchAPI<any>("/stocks/data-completeness");
+}
 
 // 盘前选股
 export async function triggerPreMarket(tradeDate?: string) {
