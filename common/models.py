@@ -150,7 +150,7 @@ class ShareholderCount(Base):
     code: Mapped[str] = mapped_column(String(10), index=True)
     end_date: Mapped[date] = mapped_column(Date)
     holder_count: Mapped[int | None] = mapped_column(Integer)
-    holder_count_change: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    holder_count_change: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
     avg_holding: Mapped[Decimal | None] = mapped_column(Numeric(16, 2))
     source: Mapped[str | None] = mapped_column(String(20))
     updated_at: Mapped[datetime | None] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())

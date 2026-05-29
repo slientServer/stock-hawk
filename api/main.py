@@ -33,10 +33,22 @@ def get_cors_origins() -> list[str]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import asyncio
     session_factory = get_session_factory()
     agent_scheduler = AgentScheduler(session_factory)
     app.state.agent_scheduler = agent_scheduler
     agent_scheduler.start()
+
+    # 启动时异步预热 ETF 实时行情缓存，避免首次访问返回空数据
+    async def _warmup_etf_spot():
+        try:
+            from api.routes.etf_analysis import _fetch_etf_spot_cached
+            await _fetch_etf_spot_cached(wait_timeout=30.0, force_refresh=True)
+        except Exception:
+            pass
+
+    asyncio.create_task(_warmup_etf_spot())
+
     try:
         yield
     finally:

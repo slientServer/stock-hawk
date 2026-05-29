@@ -9,6 +9,7 @@ import {
   Card,
   Col,
   Collapse,
+  DatePicker,
   Descriptions,
   Divider,
   Empty,
@@ -32,6 +33,7 @@ import {
   DashboardOutlined,
   EditOutlined,
   EyeOutlined,
+  FilterOutlined,
   FundOutlined,
   MinusCircleOutlined,
   PlusOutlined,
@@ -41,8 +43,21 @@ import {
   RiseOutlined,
   SearchOutlined,
   SettingOutlined,
+  StockOutlined,
   SyncOutlined,
+  TeamOutlined,
 } from "@ant-design/icons";
+import {
+  CartesianGrid,
+  Line,
+  LineChart,
+  ReferenceLine,
+  ResponsiveContainer,
+  Tooltip as RechartTooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
+import dayjs from "dayjs";
 import { useRouter } from "next/navigation";
 import {
   addWatchItem,
@@ -51,6 +66,8 @@ import {
   getPortfolioQuote,
   getPositions,
   getPreMarketLatest,
+  getSurgeScreener,
+  getStockKline,
   getWatchlist,
   removeWatchItem,
   searchStocks,
@@ -774,7 +791,7 @@ function WatchlistSection({ onAddFromOutside }: { onAddFromOutside?: (fn: (data:
         okText={editItem ? "保存" : "确认添加"}
         confirmLoading={submitting}
         width={520}
-        destroyOnClose
+        destroyOnHidden
       >
         <Form form={form} layout="vertical" size="small">
           <Row gutter={8}>
@@ -822,6 +839,324 @@ function WatchlistSection({ onAddFromOutside }: { onAddFromOutside?: (fn: (data:
           </Form.Item>
         </Form>
       </Modal>
+    </div>
+  );
+}
+
+// ─── 涨幅 K 线图 ──────────────────────────────────────────────────────────────
+function SurgeKlineChart({ kline, surgeDate }: { kline: any[]; surgeDate: string }) {
+  const chartData = kline.map((item) => ({
+    date: (item.trade_date as string)?.slice(5),
+    close: Number(item.close),
+    fullDate: item.trade_date as string,
+  }));
+  const prices = chartData.map((d) => d.close);
+  const minP = Math.min(...prices) * 0.985;
+  const maxP = Math.max(...prices) * 1.015;
+  const tickInterval = Math.max(1, Math.floor(chartData.length / 10));
+  const surgeItem = chartData.find((d) => d.fullDate === surgeDate);
+
+  return (
+    <div>
+      <Text type="secondary" style={{ fontSize: 11 }}>近 120 日收盘走势（红线标记涨幅日）</Text>
+      <ResponsiveContainer width="100%" height={200}>
+        <LineChart data={chartData} margin={{ top: 8, right: 20, left: 0, bottom: 0 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+          <XAxis dataKey="date" tick={{ fontSize: 10 }} interval={tickInterval} />
+          <YAxis domain={[minP, maxP]} tick={{ fontSize: 10 }} width={56} tickFormatter={(v) => v.toFixed(2)} />
+          <RechartTooltip
+            formatter={(v: any) => [`¥${Number(v).toFixed(2)}`, "收盘价"]}
+            labelFormatter={(l) => String(l)}
+          />
+          {surgeItem && (
+            <ReferenceLine
+              x={surgeItem.date}
+              stroke="#cf1322"
+              strokeDasharray="4 4"
+              label={{ value: "涨", position: "top", fontSize: 10, fill: "#cf1322" }}
+            />
+          )}
+          <Line type="monotone" dataKey="close" stroke="#1677ff" dot={false} strokeWidth={1.5} />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+// ─── 涨幅筛选区块 ─────────────────────────────────────────────────────────────
+function SurgeScreenerSection() {
+  const { message } = App.useApp();
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState<{ items: any[]; total: number } | null>(null);
+  const [dateRange, setDateRange] = useState<[dayjs.Dayjs, dayjs.Dayjs]>([
+    dayjs().subtract(30, "day"),
+    dayjs(),
+  ]);
+  const [minPct, setMinPct] = useState<number>(5);
+  const [klineCache, setKlineCache] = useState<Record<string, any[] | null>>({});
+
+  const handleSearch = useCallback(async () => {
+    const [start, end] = dateRange;
+    setLoading(true);
+    try {
+      const res = await getSurgeScreener({
+        start_date: start.format("YYYY-MM-DD"),
+        end_date: end.format("YYYY-MM-DD"),
+        min_pct: minPct,
+      });
+      setResult(res);
+      if (res.error) message.warning(`查询部分异常: ${res.error}`);
+      else message.success(`筛选完成，共 ${res.total} 条记录`);
+    } catch (e) {
+      message.error(e instanceof Error ? e.message : "查询失败");
+    } finally {
+      setLoading(false);
+    }
+  }, [dateRange, minPct, message]);
+
+  const loadKline = useCallback(async (code: string) => {
+    if (code in klineCache) return;
+    // null = 加载中，防止重复请求
+    setKlineCache((prev) => ({ ...prev, [code]: null }));
+    try {
+      const kline = await getStockKline(code, 120);
+      setKlineCache((prev) => ({ ...prev, [code]: kline }));
+    } catch {
+      setKlineCache((prev) => ({ ...prev, [code]: [] }));
+    }
+  }, [klineCache]);
+
+  const columns = [
+    {
+      title: "交易日",
+      dataIndex: "trade_date",
+      key: "trade_date",
+      width: 100,
+      sorter: (a: any, b: any) => a.trade_date.localeCompare(b.trade_date),
+    },
+    {
+      title: "代码",
+      dataIndex: "code",
+      key: "code",
+      width: 80,
+      render: (v: string) => <Text strong>{v}</Text>,
+    },
+    {
+      title: "名称",
+      dataIndex: "name",
+      key: "name",
+      width: 90,
+      render: (v: string) => v || "-",
+    },
+    {
+      title: "行业",
+      dataIndex: "industry",
+      key: "industry",
+      width: 110,
+      render: (v: string) => v ? <Tag style={{ fontSize: 10 }}>{v}</Tag> : <Text type="secondary">-</Text>,
+    },
+    {
+      title: "前收",
+      dataIndex: "prev_close",
+      key: "prev_close",
+      width: 72,
+      render: (v: number) => v != null ? v.toFixed(2) : "-",
+    },
+    {
+      title: "开盘",
+      dataIndex: "open",
+      key: "open",
+      width: 72,
+      render: (v: number) => v != null ? v.toFixed(2) : "-",
+    },
+    {
+      title: "收盘",
+      dataIndex: "close",
+      key: "close",
+      width: 72,
+      render: (v: number) => v != null ? v.toFixed(2) : "-",
+    },
+    {
+      title: "最高",
+      dataIndex: "high",
+      key: "high",
+      width: 72,
+      render: (v: number) => v != null ? v.toFixed(2) : "-",
+    },
+    {
+      title: "涨幅",
+      dataIndex: "change_pct",
+      key: "change_pct",
+      width: 88,
+      sorter: (a: any, b: any) => (a.change_pct ?? 0) - (b.change_pct ?? 0),
+      defaultSortOrder: "descend" as const,
+      render: (v: number) =>
+        v != null ? (
+          <Text strong style={{ color: "#cf1322" }}>{`+${v.toFixed(2)}%`}</Text>
+        ) : "-",
+    },
+    {
+      title: "成交量(万)",
+      dataIndex: "volume",
+      key: "volume",
+      width: 90,
+      sorter: (a: any, b: any) => (a.volume ?? 0) - (b.volume ?? 0),
+      render: (v: number) => v != null ? (v / 10000).toFixed(1) : "-",
+    },
+    {
+      title: "成交额(亿)",
+      dataIndex: "amount",
+      key: "amount",
+      width: 90,
+      sorter: (a: any, b: any) => (a.amount ?? 0) - (b.amount ?? 0),
+      render: (v: number) => v != null ? (v / 1e8).toFixed(2) : "-",
+    },
+    {
+      title: "换手率",
+      dataIndex: "turnover_rate",
+      key: "turnover_rate",
+      width: 72,
+      sorter: (a: any, b: any) => (a.turnover_rate ?? 0) - (b.turnover_rate ?? 0),
+      render: (v: number) => v != null ? `${v.toFixed(2)}%` : "-",
+    },
+    {
+      title: "市值(亿)",
+      dataIndex: "market_cap",
+      key: "market_cap",
+      width: 80,
+      sorter: (a: any, b: any) => (a.market_cap ?? 0) - (b.market_cap ?? 0),
+      render: (v: number) => v != null ? (v / 1e8).toFixed(1) : "-",
+    },
+  ];
+
+  return (
+    <div>
+      {/* ── 筛选条件 ── */}
+      <Space wrap style={{ marginBottom: 16 }} size={8}>
+        <DatePicker.RangePicker
+          value={dateRange}
+          onChange={(dates) => {
+            if (dates && dates[0] && dates[1]) {
+              setDateRange([dates[0], dates[1]]);
+            }
+          }}
+          format="YYYY-MM-DD"
+          allowClear={false}
+          presets={[
+            { label: "近7天", value: [dayjs().subtract(7, "day"), dayjs()] },
+            { label: "近30天", value: [dayjs().subtract(30, "day"), dayjs()] },
+            { label: "近90天", value: [dayjs().subtract(90, "day"), dayjs()] },
+            { label: "近半年", value: [dayjs().subtract(180, "day"), dayjs()] },
+          ]}
+        />
+        <Space size={4}>
+          <Text style={{ fontSize: 13 }}>单日最小涨幅</Text>
+          <InputNumber
+            min={0.1}
+            max={50}
+            step={0.5}
+            precision={1}
+            value={minPct}
+            onChange={(v) => v != null && setMinPct(v)}
+            style={{ width: 90 }}
+            addonAfter="%"
+          />
+        </Space>
+        <Button type="primary" icon={<SearchOutlined />} loading={loading} onClick={handleSearch}>
+          筛选
+        </Button>
+        {result && (
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            共找到 <Text strong>{result.total}</Text> 条记录（涨幅基于前收盘价计算）
+          </Text>
+        )}
+      </Space>
+
+      {/* ── 结果表格 ── */}
+      {result === null ? (
+        <Empty
+          description="设置日期范围和最小涨幅后点击「筛选」"
+          style={{ padding: "60px 0" }}
+        />
+      ) : result.items.length === 0 ? (
+        <Empty description="无符合条件的记录" />
+      ) : (
+        <Table
+          dataSource={result.items}
+          columns={columns}
+          rowKey={(r) => `${r.code}_${r.trade_date}`}
+          size="small"
+          scroll={{ x: 900 }}
+          pagination={{ pageSize: 50, showSizeChanger: true, showTotal: (t) => `共 ${t} 条` }}
+          expandable={{
+            expandedRowRender: (record) => {
+              return (
+                <div style={{ padding: "8px 16px" }}>
+                  {/* 基础信息 */}
+                  <Row gutter={[16, 4]} style={{ marginBottom: 10 }}>
+                    <Col span={24}>
+                      <Space size={20} wrap>
+                        <div>
+                          <Text type="secondary" style={{ fontSize: 11 }}>代码 / 名称</Text>
+                          <div>
+                            <Text strong>{record.code}</Text>
+                            <Text type="secondary" style={{ marginLeft: 6 }}>{record.name ?? "-"}</Text>
+                          </div>
+                        </div>
+                        <div>
+                          <Text type="secondary" style={{ fontSize: 11 }}>行业</Text>
+                          <div>{record.industry ?? "-"}</div>
+                        </div>
+                        <div>
+                          <Text type="secondary" style={{ fontSize: 11 }}>市场</Text>
+                          <div>{record.market ?? "-"}</div>
+                        </div>
+                        <div>
+                          <Text type="secondary" style={{ fontSize: 11 }}>市值</Text>
+                          <div>{record.market_cap != null ? `${(record.market_cap / 1e8).toFixed(1)}亿` : "-"}</div>
+                        </div>
+                        <div>
+                          <Text type="secondary" style={{ fontSize: 11 }}>涨幅</Text>
+                          <div style={{ color: "#cf1322", fontWeight: 700 }}>
+                            {record.change_pct != null ? `+${record.change_pct.toFixed(2)}%` : "-"}
+                          </div>
+                        </div>
+                        <div>
+                          <Text type="secondary" style={{ fontSize: 11 }}>前收 / 开 / 高 / 低 / 收</Text>
+                          <div style={{ fontSize: 12 }}>
+                            {[record.prev_close, record.open, record.high, record.low, record.close]
+                              .map((v) => (v != null ? v.toFixed(2) : "-"))
+                              .join(" / ")}
+                          </div>
+                        </div>
+                        <div>
+                          <Text type="secondary" style={{ fontSize: 11 }}>成交额</Text>
+                          <div>{record.amount != null ? `${(record.amount / 1e8).toFixed(2)}亿` : "-"}</div>
+                        </div>
+                        <div>
+                          <Text type="secondary" style={{ fontSize: 11 }}>换手率</Text>
+                          <div>{record.turnover_rate != null ? `${record.turnover_rate.toFixed(2)}%` : "-"}</div>
+                        </div>
+                      </Space>
+                    </Col>
+                  </Row>
+                  {/* K 线图 */}
+                  {!(record.code in klineCache) || klineCache[record.code] === null ? (
+                    <Spin size="small" />
+                  ) : (klineCache[record.code] as any[]).length === 0 ? (
+                    <Text type="secondary" style={{ fontSize: 12 }}>无 K 线数据</Text>
+                  ) : (
+                    <SurgeKlineChart kline={klineCache[record.code] as any[]} surgeDate={record.trade_date} />
+                  )}
+                </div>
+              );
+            },
+            onExpand: (expanded, record) => {
+              if (expanded) loadKline(record.code);
+            },
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -1234,6 +1569,9 @@ export default function HomePage() {
           { icon: <RadarChartOutlined />, title: "盘前选股", desc: preMarket?.trade_date ? `${preMarket.trade_date} | 激进${preMarket.aggressive?.length ?? 0}+稳健${preMarket.stable?.length ?? 0}只` : "每日7AM自动选股", path: "/pre-market", color: "#cf1322" },
           { icon: <FundOutlined />, title: "ETF分析", desc: "ETF轮动与盘后分析", path: "/etf-analysis", color: "#1677ff" },
           { icon: <RiseOutlined />, title: "持续上涨", desc: "日K趋势筛选", path: "/ten-bagger", color: "#52c41a" },
+          { icon: <FilterOutlined />, title: "涨幅筛选", desc: "A股单日涨幅个股统计", path: "/surge-screener", color: "#fa8c16" },
+          { icon: <StockOutlined />, title: "超跌反弹", desc: "优质超跌个股筛选", path: "/oversold-screener", color: "#52c41a" },
+          { icon: <TeamOutlined />, title: "股东变化", desc: "股东人数增减趋势", path: "/shareholders", color: "#1890ff" },
           { icon: <ReadOutlined />, title: "资讯中心", desc: "每小时财经资讯汇总", path: "/news-center", color: "#722ed1" },
           { icon: <SettingOutlined />, title: "配置中心", desc: "LLM与数据源设置", path: "/settings", color: "#888" },
         ].map(({ icon, title, desc, path, color }) => (
@@ -1260,7 +1598,7 @@ export default function HomePage() {
         okText="确认建仓"
         confirmLoading={addSubmitting}
         width={420}
-        destroyOnClose
+        destroyOnHidden
       >
         <Form form={addForm} layout="vertical" size="small">
           <Form.Item label="股票代码" name="code" rules={[{ required: true, message: "请输入股票代码" }]}>
@@ -1421,6 +1759,11 @@ export default function HomePage() {
             key: "watchlist",
             label: <><EyeOutlined /> 关注列表</>,
             children: <WatchlistSection />,
+          },
+          {
+            key: "surge",
+            label: <><FilterOutlined /> 涨幅筛选</>,
+            children: <SurgeScreenerSection />,
           },
         ]}
       />

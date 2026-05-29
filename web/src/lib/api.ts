@@ -202,6 +202,43 @@ export async function getFinanceNewsArticles(params: { target_date?: string; lim
 export async function getSettings() {
   return fetchAPI<any>("/settings");
 }
+
+// 股东户数
+export async function getShareholdersOverview(params: {
+  trend?: "decreasing" | "increasing";
+  keyword?: string;
+  min_market_cap?: number;
+  exclude_st?: boolean;
+  min_limit_up?: number;
+  limit?: number;
+} = {}) {
+  const q = new URLSearchParams();
+  if (params.trend) q.set("trend", params.trend);
+  if (params.keyword) q.set("keyword", params.keyword);
+  if (params.min_market_cap != null) q.set("min_market_cap", String(params.min_market_cap));
+  if (params.exclude_st != null) q.set("exclude_st", String(params.exclude_st));
+  if (params.min_limit_up != null && params.min_limit_up > 0) q.set("min_limit_up", String(params.min_limit_up));
+  if (params.limit) q.set("limit", String(params.limit));
+  return fetchAPI<{ items: any[]; total: number; error?: string }>(`/stocks/shareholders?${q}`);
+}
+
+export async function getStockShareholders(code: string, limit = 12) {
+  return fetchAPI<{ items: any[]; total: number; error?: string }>(
+    `/stocks/${code}/shareholders?limit=${limit}`
+  );
+}
+
+export async function triggerStocksCollect(task: string) {
+  return fetchAPI<any>("/stocks/collect", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ task }),
+  });
+}
+
+export async function getStocksCollectStatus() {
+  return fetchAPI<any>("/stocks/collect/status");
+}
 export async function getSchedulerInfo() {
   return fetchAPI<any>("/settings/scheduler");
 }
@@ -349,4 +386,44 @@ export async function searchStocks(q: string) {
   return fetchAPI<{ code: string; name: string; industry: string | null }[]>(
     `/watchlist/search?q=${encodeURIComponent(q)}`
   );
+}
+
+// 涨幅筛选
+export async function getSurgeScreener(params: {
+  start_date: string;
+  end_date: string;
+  min_pct: number;
+  limit?: number;
+}) {
+  const q = new URLSearchParams({
+    start_date: params.start_date,
+    end_date: params.end_date,
+    min_pct: String(params.min_pct),
+    ...(params.limit ? { limit: String(params.limit) } : {}),
+  });
+  return fetchAPI<{ items: any[]; total: number; error?: string }>(`/stocks/surge-screener?${q}`);
+}
+
+// 个股日K线（通用）
+export async function getStockKline(code: string, days = 120) {
+  return fetchAPI<any[]>(`/stocks/${encodeURIComponent(code)}/kline?days=${days}`);
+}
+
+// 超跌反弹筛选
+export async function getOversoldScreener(params: {
+  min_drawdown?: number;
+  lookback_days?: number;
+  min_market_cap?: number;
+  min_avg_amount?: number;
+  exclude_st?: boolean;
+  limit?: number;
+}) {
+  const q = new URLSearchParams();
+  if (params.min_drawdown != null) q.set("min_drawdown", String(params.min_drawdown));
+  if (params.lookback_days != null) q.set("lookback_days", String(params.lookback_days));
+  if (params.min_market_cap != null) q.set("min_market_cap", String(params.min_market_cap));
+  if (params.min_avg_amount != null) q.set("min_avg_amount", String(params.min_avg_amount));
+  if (params.exclude_st != null) q.set("exclude_st", String(params.exclude_st));
+  if (params.limit != null) q.set("limit", String(params.limit));
+  return fetchAPI<{ items: any[]; total: number; error?: string }>(`/stocks/oversold-screener?${q}`);
 }

@@ -968,30 +968,141 @@ export default function PreMarketPage() {
               key: "performance",
               label: "绩效统计",
               children: performance ? (
-                <Row gutter={[16, 16]}>
-                  {[
-                    { label: "激进标（个股）", data: performance.aggressive },
-                    { label: "稳健标（ETF）", data: performance.stable },
-                    { label: "综合", data: performance.combined },
-                  ].map(({ label, data }) => (
-                    <Col key={label} xs={24} md={8}>
-                      <Card title={label} size="small">
-                        {data?.count > 0 ? (
-                          <Space direction="vertical" size={8} style={{ width: "100%" }}>
-                            <Statistic title="总笔数" value={data.count} />
-                            <Statistic title="胜率" value={data.win_rate != null ? `${(data.win_rate * 100).toFixed(1)}%` : "-"} />
-                            <Statistic
-                              title="平均收益"
-                              value={data.avg_return != null ? fmtPct(data.avg_return) : "-"}
-                              valueStyle={{ color: (data.avg_return ?? 0) >= 0 ? "#cf1322" : "#389e0d" }}
-                            />
-                            <Statistic title="盈亏比" value={data.profit_loss_ratio != null ? data.profit_loss_ratio.toFixed(2) : "-"} />
-                          </Space>
-                        ) : <Empty description="暂无已结仓记录" />}
-                      </Card>
-                    </Col>
-                  ))}
-                </Row>
+                <Space direction="vertical" size={16} style={{ width: "100%" }}>
+                  <Row gutter={[16, 16]}>
+                    {[
+                      { label: "激进标（个股）", data: performance.aggressive },
+                      { label: "稳健标（ETF）", data: performance.stable },
+                      { label: "综合", data: performance.combined },
+                    ].map(({ label, data }) => (
+                      <Col key={label} xs={24} md={8}>
+                        <Card title={label} size="small">
+                          {data?.count > 0 ? (
+                            <Space direction="vertical" size={8} style={{ width: "100%" }}>
+                              <Statistic title="总笔数" value={data.count} />
+                              <Statistic title="胜率" value={data.win_rate != null ? `${(data.win_rate * 100).toFixed(1)}%` : "-"} />
+                              <Statistic
+                                title="平均收益"
+                                value={data.avg_return != null ? fmtPct(data.avg_return) : "-"}
+                                valueStyle={{ color: (data.avg_return ?? 0) >= 0 ? "#cf1322" : "#389e0d" }}
+                              />
+                              <Statistic title="盈亏比" value={data.profit_loss_ratio != null ? data.profit_loss_ratio.toFixed(2) : "-"} />
+                            </Space>
+                          ) : <Empty description="暂无已结仓记录" />}
+                        </Card>
+                      </Col>
+                    ))}
+                  </Row>
+                  {performance.details?.length > 0 && (
+                    <Card title="明细记录" size="small">
+                      <Table
+                        size="small"
+                        rowKey={(r: any) => `${r.code}-${r.trade_date}-${r.result_type}`}
+                        dataSource={performance.details}
+                        pagination={{ pageSize: 20, showSizeChanger: false }}
+                        columns={[
+                          {
+                            title: "名称/代码",
+                            key: "name",
+                            width: 120,
+                            render: (_: any, r: any) => (
+                              <div>
+                                <div style={{ fontWeight: 600, fontSize: 13 }}>{r.name || r.code}</div>
+                                <div style={{ fontSize: 11, color: "#8c8c8c" }}>{r.code}</div>
+                              </div>
+                            ),
+                          },
+                          {
+                            title: "类型",
+                            dataIndex: "result_type",
+                            width: 80,
+                            render: (v: string) => {
+                              const map: Record<string, [string, string]> = {
+                                aggressive_main: ["激进主", "orange"],
+                                aggressive_backup: ["激进备", "gold"],
+                                aggressive: ["激进", "orange"],
+                                stable: ["稳健", "blue"],
+                                stable_stock: ["稳健股", "geekblue"],
+                              };
+                              const [label, color] = map[v] ?? [v, "default"];
+                              return <Tag color={color}>{label}</Tag>;
+                            },
+                          },
+                          {
+                            title: "推荐日",
+                            dataIndex: "trade_date",
+                            width: 95,
+                            sorter: (a: any, b: any) => (a.trade_date || "").localeCompare(b.trade_date || ""),
+                          },
+                          {
+                            title: "买入价",
+                            dataIndex: "entry_price",
+                            width: 75,
+                            render: (v: number) => v != null ? v.toFixed(2) : "-",
+                          },
+                          {
+                            title: "目标价",
+                            dataIndex: "target_price",
+                            width: 75,
+                            render: (v: number) => v != null ? v.toFixed(2) : "-",
+                          },
+                          {
+                            title: "止损价",
+                            dataIndex: "stop_loss_price",
+                            width: 75,
+                            render: (v: number) => v != null ? v.toFixed(2) : "-",
+                          },
+                          {
+                            title: "卖出日",
+                            dataIndex: "exit_date",
+                            width: 95,
+                            render: (v: string) => v || "-",
+                          },
+                          {
+                            title: "卖出价",
+                            dataIndex: "exit_price",
+                            width: 75,
+                            render: (v: number) => v != null ? v.toFixed(2) : "-",
+                          },
+                          {
+                            title: "持仓天数",
+                            dataIndex: "holding_days",
+                            width: 80,
+                            sorter: (a: any, b: any) => (a.holding_days ?? 0) - (b.holding_days ?? 0),
+                            render: (_: any, r: any) => {
+                              if (r.exit_date) return `${r.holding_days}天`;
+                              return <Tag color="processing">持仓中 {r.holding_days}天</Tag>;
+                            },
+                          },
+                          {
+                            title: "状态",
+                            dataIndex: "exit_type",
+                            width: 110,
+                            render: (v: string, r: any) => {
+                              if (v === "take_profit") return <Tag color="success">止盈</Tag>;
+                              if (v === "stop_loss") return <Tag color="error">止损</Tag>;
+                              if (v === "max_hold") return <Tag color="warning">到期平仓</Tag>;
+                              // 进行中
+                              if (r.deadline_passed) return <Tag color="default">待回填</Tag>;
+                              return <Tag color="processing">尚未到截止日</Tag>;
+                            },
+                          },
+                          {
+                            title: "收益率",
+                            dataIndex: "return_pct",
+                            width: 90,
+                            sorter: (a: any, b: any) => (a.return_pct ?? -999) - (b.return_pct ?? -999),
+                            render: (v: number) => v != null ? (
+                              <span style={{ color: v >= 0 ? "#cf1322" : "#389e0d", fontWeight: 600 }}>
+                                {fmtPct(v)}
+                              </span>
+                            ) : "-",
+                          },
+                        ]}
+                      />
+                    </Card>
+                  )}
+                </Space>
               ) : <Empty description="暂无绩效数据" />,
             },
           ]}

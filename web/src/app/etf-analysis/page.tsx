@@ -391,7 +391,7 @@ export default function EtfAnalysisPage() {
     }
   }, []);
 
-  const loadAll = useCallback(async () => {
+  const loadAll = useCallback(async (silentQuoteRetry = false) => {
     setLoading(true);
     const [wl, lt, hs] = await Promise.all([
       getEtfWatchlist().catch(() => ({ items: [], summary: {} })),
@@ -402,6 +402,12 @@ export default function EtfAnalysisPage() {
     setLatest(lt);
     setHistory(hs as any[]);
     setLoading(false);
+
+    // 若关注列表有 ETF 但价格全为空（API 重启后缓存冷启动），自动触发一次行情刷新
+    const items = (wl as any)?.items ?? [];
+    if (!silentQuoteRetry && items.length > 0 && items.every((i: any) => i.current_price == null)) {
+      refreshEtfQuotes().catch(() => {}).finally(() => loadAll(true));
+    }
   }, []);
 
   useEffect(() => {
@@ -1489,7 +1495,7 @@ export default function EtfAnalysisPage() {
           >
             立即分析
           </Button>
-          <Button icon={<ReloadOutlined />} onClick={loadAll}>刷新</Button>
+          <Button icon={<ReloadOutlined />} onClick={() => loadAll()}>刷新</Button>
         </Space>
       </div>
 

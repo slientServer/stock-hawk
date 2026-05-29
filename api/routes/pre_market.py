@@ -119,6 +119,22 @@ async def _run_pre_market_task(
         llm = LLMClient()
         notifier = NotificationTools()
 
+        # Step 0: 自动补采最新 K 线（避免定时任务漏跑导致数据过期）
+        _set_task(task_id, progress=8, step="自动补采最新K线")
+        try:
+            from data_collector.sources.market_kline import KlineCollector
+            from data_collector.storage import DataStorage
+            kline_result = await KlineCollector(DataStorage(session_factory), RedisCache()).collect_full_market_daily(lookback_days=5)
+            logger.info("[PreMarket] K线补采完成: trade_date=%s records=%s", kline_result.get("trade_date"), kline_result.get("records_count"))
+            # 采完后重新解析最新交易日，确保用最新数据
+            latest = await _resolve_trade_date(None, session_factory)
+            if latest and latest > trade_date:
+                logger.info("[PreMarket] 交易日更新: %s -> %s", trade_date, latest)
+                trade_date = latest
+                _set_task(task_id, trade_date=str(trade_date))
+        except Exception as e:
+            logger.warning("[PreMarket] K线补采失败（跳过，继续选股）: %s", e)
+
         # Step 1: 催化分析
         _set_task(task_id, progress=10, step="分析昨夜催化板块")
         analyzer = CatalystAnalyzer(session_factory, config, llm)
@@ -446,12 +462,21 @@ async def get_performance(
 ):
     since = date.today() - timedelta(days=days)
     async with session_factory() as session:
-        rows = (
+        # 已结仓记录用于统计
+        closed_rows = (
             await session.execute(
                 select(PreMarketResult).where(
                     PreMarketResult.trade_date >= since,
                     PreMarketResult.exit_type.isnot(None),
                     PreMarketResult.exit_type.notin_(["pending"]),
+                )
+            )
+        ).scalars().all()
+        # 全部记录（含进行中）用于明细展示
+        all_rows = (
+            await session.execute(
+                select(PreMarketResult).where(
+                    PreMarketResult.trade_date >= since,
                 )
             )
         ).scalars().all()
@@ -475,13 +500,50 @@ async def get_performance(
             "profit_loss_ratio": round(pl_ratio, 4) if pl_ratio else None,
         }
 
-    agg_rows = [r for r in rows if r.result_type in ("aggressive", "aggressive_main", "aggressive_backup")]
-    stable_rows = [r for r in rows if r.result_type in ("stable", "stable_stock")]
+    agg_rows = [r for r in closed_rows if r.result_type in ("aggressive", "aggressive_main", "aggressive_backup")]
+    stable_rows = [r for r in closed_rows if r.result_type in ("stable", "stable_stock")]
+
+    today = date.today()
+
+    def _detail(items):
+        result = []
+        for r in items:
+            # 持仓天数：已结仓用 exit_date - trade_date，进行中用 today - trade_date
+            if r.actual_exit_date and r.trade_date:
+                holding_days = (r.actual_exit_date - r.trade_date).days
+            elif r.trade_date:
+                holding_days = (today - r.trade_date).days
+            else:
+                holding_days = None
+
+            # 截止日判断：trade_date + ~5个日历日（3个交易日约等于5天）
+            deadline_passed = r.trade_date and (today - r.trade_date).days > 5
+
+            result.append({
+                "code": r.code,
+                "name": r.name,
+                "result_type": r.result_type,
+                "trade_date": str(r.trade_date) if r.trade_date else None,
+                "entry_price": float(r.close_price) if r.close_price is not None else None,
+                "target_price": float(r.target_price) if r.target_price is not None else None,
+                "stop_loss_price": float(r.stop_loss_price) if r.stop_loss_price is not None else None,
+                "exit_date": str(r.actual_exit_date) if r.actual_exit_date else None,
+                "exit_price": float(r.actual_exit_price) if r.actual_exit_price is not None else None,
+                "exit_type": r.exit_type,
+                "holding_days": holding_days,
+                "deadline_passed": deadline_passed,
+                "return_pct": float(r.actual_return_pct) if r.actual_return_pct is not None else None,
+            })
+        # 按推荐日倒序
+        result.sort(key=lambda x: x["trade_date"] or "", reverse=True)
+        return result
+
     return {
         "since": str(since),
         "aggressive": _stats(agg_rows),
         "stable": _stats(stable_rows),
-        "combined": _stats(rows),
+        "combined": _stats(closed_rows),
+        "details": _detail(all_rows),
     }
 
 

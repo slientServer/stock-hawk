@@ -8,6 +8,9 @@ import {
   RadarChartOutlined,
   RiseOutlined,
   ReadOutlined,
+  FilterOutlined,
+  StockOutlined,
+  TeamOutlined,
 } from "@ant-design/icons";
 import { usePathname, useRouter } from "next/navigation";
 import zhCN from "antd/locale/zh_CN";
@@ -20,6 +23,9 @@ const NAV_ITEMS = [
   { key: "/etf-analysis", label: "ETF分析", icon: <FundOutlined /> },
   { key: "/ten-bagger", label: "持续上涨", icon: <RiseOutlined /> },
   { key: "/pre-market", label: "盘前选股", icon: <RadarChartOutlined /> },
+  { key: "/surge-screener", label: "涨幅筛选", icon: <FilterOutlined /> },
+  { key: "/oversold-screener", label: "超跌反弹", icon: <StockOutlined /> },
+  { key: "/shareholders", label: "股东变化", icon: <TeamOutlined /> },
   { key: "/news-center", label: "资讯中心", icon: <ReadOutlined /> },
   { key: "/settings", label: "设置", icon: <SettingOutlined /> },
 ];

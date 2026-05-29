@@ -6,13 +6,13 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, func, select, distinct
+from sqlalchemy import case, desc, func, select, distinct, and_, or_
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.deps import get_db, get_session_factory
 from common.config import get_settings
-from common.models import Base, CommodityPrice, DailyKline, FundFlow, FinancialReport, InstitutionalHolding, NewsEvent, OverseasMapping, OverseasStock, Signal, Stock
+from common.models import Base, CommodityPrice, DailyKline, FundFlow, FinancialReport, InstitutionalHolding, NewsEvent, OverseasMapping, OverseasStock, ShareholderCount, Signal, Stock
 from data_collector.cache.redis_cache import RedisCache
 from data_collector.sources.commodity_price import CommodityPriceCollector
 from data_collector.sources.financial_report import FinancialReportCollector
@@ -42,6 +42,7 @@ DataTask = Literal[
     "seed_klines",
     "fund_flow",
     "seed_shareholders",
+    "shareholders_all",
     "seed_financials",
     "seed_graph",
     "focus_all",
@@ -405,6 +406,14 @@ async def _run_collect_task(req: DataCollectRequest) -> dict:
 
     if req.task in {"seed_shareholders", "focus_all", "seed_all"}:
         await run_step("seed_shareholders", lambda: ShareholderCollector(storage).collect_batch(codes))
+
+    if req.task == "shareholders_all":
+        # 从 stocks 表取全量代码，覆盖全市场
+        from sqlalchemy import text as sa_text
+        async with get_session_factory()() as _db:
+            all_codes_rows = (await _db.execute(sa_text("SELECT code FROM stocks"))).fetchall()
+        all_codes = [r[0] for r in all_codes_rows]
+        await run_step("shareholders_all", lambda: ShareholderCollector(storage).collect_batch(all_codes))
 
     if req.task in {"seed_financials", "focus_all", "seed_all"}:
         collector = FinancialReportCollector(storage)
@@ -1007,6 +1016,223 @@ async def trigger_collect(req: DataCollectRequest, background_tasks: BackgroundT
     }
 
 
+@router.get("/surge-screener")
+async def get_surge_screener(
+    start_date: date = Query(..., description="开始日期，如 2024-01-01"),
+    end_date: date = Query(..., description="结束日期，如 2024-03-31"),
+    min_pct: float = Query(5.0, ge=0.1, le=50.0, description="最小单日涨幅(%)，基于前收盘价计算"),
+    limit: int = Query(200, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+):
+    """A股单日涨幅筛选：查找指定周期内单日涨幅大于阈值的所有交易记录（涨幅 = (收盘 - 前收) / 前收 × 100）"""
+    from sqlalchemy import func as sqlfunc
+
+    # 内层子查询：使用 LAG 窗口函数计算前日收盘，日期范围略向前扩展以确保第一个交易日有 prev_close
+    inner = (
+        select(
+            DailyKline.code,
+            DailyKline.trade_date,
+            DailyKline.open,
+            DailyKline.close,
+            DailyKline.high,
+            DailyKline.low,
+            DailyKline.volume,
+            DailyKline.amount,
+            DailyKline.turnover_rate,
+            sqlfunc.lag(DailyKline.close).over(
+                partition_by=DailyKline.code,
+                order_by=DailyKline.trade_date,
+            ).label("prev_close"),
+        )
+        .where(DailyKline.trade_date >= start_date - timedelta(days=10))
+        .where(DailyKline.trade_date <= end_date)
+    ).subquery("kline_with_prev")
+
+    # 外层查询：过滤日期范围 + 涨幅阈值
+    gain_expr = (inner.c.close - inner.c.prev_close) / inner.c.prev_close * 100
+
+    stmt = (
+        select(
+            inner.c.code,
+            inner.c.trade_date,
+            inner.c.open,
+            inner.c.close,
+            inner.c.high,
+            inner.c.low,
+            inner.c.volume,
+            inner.c.amount,
+            inner.c.turnover_rate,
+            inner.c.prev_close,
+            gain_expr.label("change_pct"),
+        )
+        .where(inner.c.trade_date.between(start_date, end_date))
+        .where(inner.c.prev_close.isnot(None))
+        .where(inner.c.prev_close > 0)
+        .where(gain_expr >= min_pct)
+        .order_by(desc(gain_expr))
+        .limit(limit)
+    )
+
+    try:
+        rows = (await db.execute(stmt)).all()
+    except Exception as e:
+        return {"items": [], "total": 0, "error": str(e)}
+
+    codes = list({r.code for r in rows})
+    stock_map: dict[str, Stock] = {}
+    if codes:
+        stock_rows = (await db.execute(select(Stock).where(Stock.code.in_(codes)))).scalars().all()
+        stock_map = {s.code: s for s in stock_rows}
+
+    items = []
+    for r in rows:
+        s = stock_map.get(r.code)
+        items.append({
+            "code": r.code,
+            "name": s.name if s else None,
+            "industry": s.industry if s else None,
+            "market_cap": float(s.market_cap) if s and s.market_cap else None,
+            "market": s.market if s else None,
+            "listed_date": str(s.listed_date) if s and s.listed_date else None,
+            "trade_date": str(r.trade_date),
+            "open": float(r.open) if r.open is not None else None,
+            "close": float(r.close) if r.close is not None else None,
+            "high": float(r.high) if r.high is not None else None,
+            "low": float(r.low) if r.low is not None else None,
+            "prev_close": float(r.prev_close) if r.prev_close is not None else None,
+            "change_pct": round(float(r.change_pct), 2) if r.change_pct is not None else None,
+            "volume": r.volume,
+            "amount": float(r.amount) if r.amount is not None else None,
+            "turnover_rate": float(r.turnover_rate) if r.turnover_rate is not None else None,
+        })
+
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/oversold-screener")
+async def get_oversold_screener(
+    min_drawdown: float = Query(20.0, ge=5.0, le=80.0, description="最小回撤幅度(%)，如 20 表示从近期高点下跌超过 20%"),
+    lookback_days: int = Query(60, ge=20, le=365, description="高点计算窗口（天数）"),
+    min_market_cap: float = Query(20.0, ge=0, description="最小市值（亿元），0=不限制"),
+    min_avg_amount: float = Query(0.0, ge=0, description="最小日均成交额（亿元），0=不限制"),
+    exclude_st: bool = Query(True, description="排除ST股"),
+    limit: int = Query(100, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+):
+    """超跌反弹股筛选：筛选从近N日高点大幅回撤的优质个股，捕捉潜在反弹机会。
+
+    回撤幅度 = (当前收盘价 - 近N日最高收盘价) / 近N日最高收盘价 × 100（负数）
+    """
+    from sqlalchemy import func as sqlfunc
+
+    lookback_start = date.today() - timedelta(days=lookback_days + 10)
+    recent_30d = date.today() - timedelta(days=30)
+
+    # 子查询1：近N天K线数据，附带窗口函数（每股最高收盘 + 行号排序）
+    kline_window = (
+        select(
+            DailyKline.code,
+            DailyKline.close,
+            DailyKline.trade_date,
+            sqlfunc.max(DailyKline.close).over(
+                partition_by=DailyKline.code
+            ).label("high_in_window"),
+            sqlfunc.row_number().over(
+                partition_by=DailyKline.code,
+                order_by=desc(DailyKline.trade_date),
+            ).label("rn"),
+        )
+        .where(DailyKline.trade_date >= lookback_start)
+    ).subquery("kw")
+
+    # 子查询2：每只股票最新收盘价及窗口内最高价（取 rn=1 即最新交易日）
+    latest_with_high = (
+        select(
+            kline_window.c.code,
+            kline_window.c.close.label("current_close"),
+            kline_window.c.trade_date.label("latest_trade_date"),
+            kline_window.c.high_in_window.label("high_price"),
+        )
+        .where(kline_window.c.rn == 1)
+    ).subquery("lwh")
+
+    # 子查询3：近30天日均成交额
+    avg_amount_sub = (
+        select(
+            DailyKline.code,
+            sqlfunc.avg(DailyKline.amount).label("avg_amount_20d"),
+        )
+        .where(DailyKline.trade_date >= recent_30d)
+        .group_by(DailyKline.code)
+    ).subquery("aa")
+
+    # 回撤幅度表达式（结果为负数，越小表示跌得越多）
+    drawdown_expr = (
+        (latest_with_high.c.current_close - latest_with_high.c.high_price)
+        / latest_with_high.c.high_price
+        * 100
+    )
+
+    stmt = (
+        select(
+            latest_with_high.c.code,
+            latest_with_high.c.current_close,
+            latest_with_high.c.latest_trade_date,
+            latest_with_high.c.high_price,
+            drawdown_expr.label("drawdown_pct"),
+            avg_amount_sub.c.avg_amount_20d,
+            Stock.name,
+            Stock.industry,
+            Stock.market,
+            Stock.market_cap,
+            Stock.is_st,
+            Stock.listed_date,
+        )
+        .select_from(latest_with_high)
+        .join(Stock, latest_with_high.c.code == Stock.code)  # 内连接，要求有基础股票信息
+        .join(avg_amount_sub, latest_with_high.c.code == avg_amount_sub.c.code, isouter=True)
+        .where(latest_with_high.c.high_price > 0)
+        .where(latest_with_high.c.current_close > 0)
+        .where(drawdown_expr <= -min_drawdown)
+    )
+
+    if exclude_st:
+        stmt = stmt.where(or_(Stock.is_st.is_(None), ~Stock.is_st))
+
+    if min_market_cap > 0:
+        stmt = stmt.where(Stock.market_cap >= min_market_cap * 1e8)
+
+    if min_avg_amount > 0:
+        stmt = stmt.where(avg_amount_sub.c.avg_amount_20d >= min_avg_amount * 1e8)
+
+    stmt = stmt.order_by(drawdown_expr.asc()).limit(limit)
+
+    try:
+        rows = (await db.execute(stmt)).all()
+    except Exception as e:
+        return {"items": [], "total": 0, "error": str(e)}
+
+    items = [
+        {
+            "code": r.code,
+            "name": r.name,
+            "industry": r.industry,
+            "market": r.market,
+            "market_cap": float(r.market_cap) if r.market_cap is not None else None,
+            "is_st": r.is_st,
+            "listed_date": str(r.listed_date) if r.listed_date else None,
+            "current_close": float(r.current_close) if r.current_close is not None else None,
+            "high_price": float(r.high_price) if r.high_price is not None else None,
+            "drawdown_pct": round(float(r.drawdown_pct), 2) if r.drawdown_pct is not None else None,
+            "avg_amount_20d": float(r.avg_amount_20d) if r.avg_amount_20d is not None else None,
+            "latest_trade_date": str(r.latest_trade_date),
+        }
+        for r in rows
+    ]
+
+    return {"items": items, "total": len(items)}
+
+
 @router.get("")
 async def list_stocks(
     industry: str | None = Query(None),
@@ -1067,6 +1293,139 @@ async def refresh_financial_reports(req: FinancialRefreshRequest):
     collector = FinancialReportCollector(storage)
     result = await collector.collect_batch(codes, years=req.years)
     return result.as_dict()
+
+
+@router.get("/shareholders")
+async def get_shareholders_overview(
+    trend: str | None = Query(None, description="decreasing=减少 increasing=增加"),
+    keyword: str | None = Query(None, description="股票代码或名称"),
+    min_market_cap: float = Query(0, ge=0, description="最小市值（亿元）"),
+    exclude_st: bool = Query(True),
+    min_limit_up: int = Query(0, ge=0, description="近180日最少涨停次数"),
+    limit: int = Query(500, ge=1, le=10000),
+    db: AsyncSession = Depends(get_db),
+):
+    """股东户数总览：返回每只股票最新一期的股东户数及变动情况。"""
+    from sqlalchemy import func as sqlfunc
+
+    # 每只股票取最新一期
+    ranked = (
+        select(
+            ShareholderCount.code,
+            ShareholderCount.end_date,
+            ShareholderCount.holder_count,
+            ShareholderCount.holder_count_change,
+            ShareholderCount.avg_holding,
+            sqlfunc.row_number().over(
+                partition_by=ShareholderCount.code,
+                order_by=desc(ShareholderCount.end_date),
+            ).label("rn"),
+        )
+    ).subquery("ranked")
+
+    latest = (
+        select(
+            ranked.c.code,
+            ranked.c.end_date.label("latest_date"),
+            ranked.c.holder_count.label("latest_count"),
+            ranked.c.holder_count_change.label("latest_change"),
+            ranked.c.avg_holding,
+        )
+        .where(ranked.c.rn == 1)
+    ).subquery("latest")
+
+    # 近180日涨停次数子查询（LAG 计算前一日收盘，按板块区分涨停阈值）
+    cutoff = date.today() - timedelta(days=180)
+    kline_lag = (
+        select(
+            DailyKline.code,
+            DailyKline.close,
+            sqlfunc.lag(DailyKline.close).over(
+                partition_by=DailyKline.code,
+                order_by=DailyKline.trade_date,
+            ).label("prev_close"),
+            case(
+                (DailyKline.code.like("688%"), 0.185),
+                (DailyKline.code.like("689%"), 0.185),
+                (DailyKline.code.like("300%"), 0.185),
+                (DailyKline.code.like("301%"), 0.185),
+                (DailyKline.code.like("8%"), 0.285),
+                (DailyKline.code.like("4%"), 0.285),
+                else_=0.095,
+            ).label("threshold"),
+        ).where(DailyKline.trade_date >= cutoff)
+    ).subquery("kline_lag")
+
+    limit_up_sub = (
+        select(
+            kline_lag.c.code,
+            sqlfunc.count().filter(
+                kline_lag.c.prev_close.isnot(None)
+                & (
+                    (kline_lag.c.close - kline_lag.c.prev_close)
+                    / kline_lag.c.prev_close
+                    >= kline_lag.c.threshold
+                )
+            ).label("limit_up_count"),
+        ).group_by(kline_lag.c.code)
+    ).subquery("limit_up_sub")
+
+    stmt = (
+        select(
+            latest.c.code,
+            latest.c.latest_date,
+            latest.c.latest_count,
+            latest.c.latest_change,
+            latest.c.avg_holding,
+            Stock.name,
+            Stock.industry,
+            Stock.market,
+            Stock.market_cap,
+            Stock.is_st,
+            sqlfunc.coalesce(limit_up_sub.c.limit_up_count, 0).label("limit_up_count"),
+        )
+        .select_from(latest)
+        .join(Stock, latest.c.code == Stock.code)
+        .outerjoin(limit_up_sub, latest.c.code == limit_up_sub.c.code)
+    )
+
+    if exclude_st:
+        stmt = stmt.where(or_(Stock.is_st.is_(None), ~Stock.is_st))
+    if min_market_cap > 0:
+        stmt = stmt.where(Stock.market_cap >= min_market_cap * 1e8)
+    if keyword:
+        stmt = stmt.where(Stock.name.contains(keyword) | Stock.code.contains(keyword))
+    if trend == "decreasing":
+        stmt = stmt.where(latest.c.latest_change < 0)
+    elif trend == "increasing":
+        stmt = stmt.where(latest.c.latest_change > 0)
+    if min_limit_up > 0:
+        stmt = stmt.where(sqlfunc.coalesce(limit_up_sub.c.limit_up_count, 0) >= min_limit_up)
+
+    stmt = stmt.order_by(latest.c.latest_change.asc().nulls_last()).limit(limit)
+
+    try:
+        rows = (await db.execute(stmt)).all()
+    except Exception as e:
+        return {"items": [], "total": 0, "error": str(e)}
+
+    items = [
+        {
+            "code": r.code,
+            "name": r.name,
+            "industry": r.industry,
+            "market": r.market,
+            "market_cap": float(r.market_cap) / 1e8 if r.market_cap else None,
+            "is_st": r.is_st,
+            "latest_date": str(r.latest_date),
+            "latest_count": r.latest_count,
+            "latest_change": float(r.latest_change) if r.latest_change is not None else None,
+            "avg_holding": float(r.avg_holding) if r.avg_holding is not None else None,
+            "limit_up_count": r.limit_up_count,
+        }
+        for r in rows
+    ]
+    return {"items": items, "total": len(items)}
 
 
 @router.get("/{code}/snapshot")
@@ -1250,3 +1609,33 @@ async def get_financials(
         }
         for r in rows
     ]
+
+
+@router.get("/{code}/shareholders")
+async def get_stock_shareholders(
+    code: str,
+    limit: int = Query(12, ge=1, le=40),
+    db: AsyncSession = Depends(get_db),
+):
+    """个股股东户数历史（最近 N 期，时间正序）"""
+    stmt = (
+        select(ShareholderCount)
+        .where(ShareholderCount.code == code)
+        .order_by(desc(ShareholderCount.end_date))
+        .limit(limit)
+    )
+    try:
+        rows = (await db.execute(stmt)).scalars().all()
+    except Exception as e:
+        return {"items": [], "error": str(e)}
+
+    items = [
+        {
+            "end_date": str(r.end_date),
+            "holder_count": r.holder_count,
+            "holder_count_change": float(r.holder_count_change) if r.holder_count_change is not None else None,
+            "avg_holding": float(r.avg_holding) if r.avg_holding is not None else None,
+        }
+        for r in reversed(rows)
+    ]
+    return {"items": items, "total": len(items)}
